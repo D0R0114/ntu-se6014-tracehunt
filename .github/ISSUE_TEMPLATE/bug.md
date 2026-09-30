@@ -1,22 +1,17 @@
 ---
-name: Bug / blocker
+name: Bug or blocker
 about: Something is broken or blocking your module
-title: "[M?] <what broke>"
+title: "[M?] what broke"
 labels: "bug"
 assignees: ""
 ---
 
-## Role
-M1 / M2 / M3 / M4 / M5 / M6
+Which role hit this: M1, M2, M3, M4, M5, or M6.
 
-## What happened
-Exact error message, failing command, or blocked step.
+What happened: paste the exact error message or the failing command.
 
-## How to reproduce
-Steps or the failing test.
+How to reproduce it: the steps or the test that fails.
 
-## Environment
-Docker Compose stack? local? which node/container?
+Where it runs: Docker Compose stack, local machine, which container or node.
 
-## Blocking?
-If this stops your milestone work, add the `blocked` label.
+If this stops your milestone work, add the blocked label so the team sees it early.

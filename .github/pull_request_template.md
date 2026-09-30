@@ -1,17 +1,15 @@
-## What
-<!-- one line: what does this PR do -->
+One line on what this PR does.
 
-closes #
+Write "closes #" plus the issue number here, so the issue closes itself when this merges.
 
-## Why
-<!-- link the issue / milestone it serves -->
+Why it is needed, and which milestone it serves.
 
-## How to verify
-<!-- exact command or steps the reviewer (your review pair) runs -->
+How the reviewer can check it: the exact command or steps your review pair should run.
 
-## Checklist
-- [ ] Branch named `<role>/<topic>`
-- [ ] `closes #<issue>` filled in above
-- [ ] Acceptance criteria from the issue met
-- [ ] Review pair assigned (M1↔M6, M2↔M3, M4↔M5)
-- [ ] No secrets / ground-truth manifest committed
+Before requesting review, make sure of these:
+
+- your branch is named with your role and topic
+- the issue number above is filled in
+- the acceptance criteria from the issue are actually met
+- your review pair is assigned (M1 with M6, M2 with M3, M4 with M5)
+- nothing secret is committed, including the ground truth manifest
