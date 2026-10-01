@@ -4,12 +4,14 @@ Write "closes #" plus the issue number here, so the issue closes itself when thi
 
 Why it is needed, and which milestone it serves.
 
-How the reviewer can check it: the exact command or steps your review pair should run.
+How the reviewer can check it: the exact command or steps the project lead can run to verify this works.
 
 Before requesting review, make sure of these:
 
 - your branch is named with your role and topic
 - the issue number above is filled in
 - the acceptance criteria from the issue are actually met
-- your review pair is assigned (M1 with M6, M2 with M3, M4 with M5)
+- you have tested your changes locally and written down how
 - nothing secret is committed, including the ground truth manifest
+
+All pull requests are reviewed and merged by the project lead. Direct pushes to main are not allowed.
