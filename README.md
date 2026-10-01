@@ -20,9 +20,9 @@ M6 runs the experiment and owns the product side: ground truth, decoy traffic, t
 
 ## How we work
 
-Main is locked down. Nobody pushes to it directly. Every change reaches main through a pull request that the project lead reviews and merges, and the lead is the only person with write access to the repository.
+Main is locked down with branch protection. Nobody pushes to it directly. Every change reaches main through a pull request that the project lead reviews and merges, and the lead is the only person with write access to the repository.
 
-Members report their progress to the lead as they go, either as a pull request from their own branch or by sending their files if they do not have repository access. The lead reviews the work, tests it, and merges it once it is sound. Review comments come back through the pull request or through the group chat.
+Members work through forks. Fork this repository, do your work on a branch in your fork, and open a pull request against main here. The lead reviews it, tests it, and merges it once it is sound. Review comments come back on the pull request. You can also open issues and comment even without write access.
 
 Name your branch with your role and the topic, for example m1/elk-setup or m4/mcp-tools.
 
