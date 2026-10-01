@@ -18,15 +18,15 @@ M5 implements the hunt workflow state machine and the verifier.
 
 M6 runs the experiment and owns the product side: ground truth, decoy traffic, the two-run comparison, and the final pitch.
 
-Each pair reviews the other's pull requests: M1 with M6, M2 with M3, M4 with M5.
-
 ## How we work
 
-Everything goes through pull requests, so every change keeps its author, diff, and timestamp. Please do not push straight to main.
+Main is locked down. Nobody pushes to it directly. Every change reaches main through a pull request that the project lead reviews and merges, and the lead is the only person with write access to the repository.
+
+Members report their progress to the lead as they go, either as a pull request from their own branch or by sending their files if they do not have repository access. The lead reviews the work, tests it, and merges it once it is sound. Review comments come back through the pull request or through the group chat.
 
 Name your branch with your role and the topic, for example m1/elk-setup or m4/mcp-tools.
 
-One task is one issue. Assign it to yourself, add your M label, and attach it to the right milestone. Write the acceptance criteria in the issue body, and put "closes #12" in your PR description so the issue closes automatically when the PR merges.
+One task is one issue. Add your M label and attach it to the right milestone. Write the acceptance criteria in the issue body, and put "closes #12" in the PR description so the issue closes automatically when the PR merges.
 
 If you get stuck, add the blocked label and leave a comment saying why. It is an early warning for the team, not a failure.
 
