@@ -44,6 +44,11 @@ try {
         "--output", (Join-Path $demoOutput "zeek/accepted.jsonl"),
         "--quarantine", (Join-Path $demoOutput "zeek/quarantine.jsonl")
     )
+    Invoke-DemoStage -Name "Normalize flat Sysmon records without a source hint" -ExpectedExit 0 -Arguments @(
+        "normalize", "--input", "fixtures/sysmon-flat.ndjson",
+        "--output", (Join-Path $demoOutput "sysmon-flat/accepted.jsonl"),
+        "--quarantine", (Join-Path $demoOutput "sysmon-flat/quarantine.jsonl")
+    )
     Invoke-DemoStage -Name "Quarantine invalid records" -ExpectedExit 2 -Arguments @(
         "normalize", "--input", "fixtures/invalid.ndjson",
         "--output", (Join-Path $demoOutput "invalid/accepted.jsonl"),

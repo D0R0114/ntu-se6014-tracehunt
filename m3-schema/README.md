@@ -26,7 +26,11 @@ python -m tracehunt_schema schemas
 
 The demo creates a new directory under `output/` and exercises normalization,
 quarantine, manual approval, automatic onboarding, and frozen parser reuse.
-All fixtures are synthetic. The 61 tests run offline; model responses are mocked.
+All fixtures are synthetic. The 101 tests run offline; model responses are mocked.
+Regression tests cover HTTP Host mapping, whitespace-only identifiers, flat
+and mixed-field Sysmon detection, numeric limits, registry/file protection,
+and continued processing after malformed input.
+For additional resilience checks, run `python tests/mutation_check.py`.
 
 ## Process logs
 
@@ -78,7 +82,9 @@ pin a parser with `--schema-id` and `--schema-version`.
 | `--quarantine` | Append-only failures with original input and structured errors |
 | `--audit` | Onboarding decisions, candidates, attempts, and validation results |
 
-Exports must use new file paths; choose a new run directory for repeated commands.
+Exports must use new file paths outside parser registry directories. Input,
+configuration, and output files must be distinct, including hard links.
+Choose a new run directory for repeated commands.
 The quarantine file is created when failures occur. Bulk files are exports;
 no Elasticsearch requests are sent.
 
@@ -87,6 +93,14 @@ routes, and an explicit timezone offset for timestamps without timezone data.
 The default ECS label is `8.11.0`. Naive timestamps are rejected unless configured;
 Sysmon's `UtcTime` is treated as UTC. Parser definitions and configuration must
 remain unchanged for repeatable document IDs.
+
+Zeek HTTP `host` is mapped to `url.domain`, with any header port removed;
+computer metadata requires explicit `host.name`. Whitespace-only identifiers
+are rejected. Input values must be finite, valid Unicode JSON with at most
+64 levels of nesting. Conflicting nested/dotted values are rejected. Windows
+event codes use canonical decimal strings, executable paths require filenames,
+and integer fields fit the signed 64-bit mapping. Malformed records are quarantined
+while processing continues.
 
 Exit codes: `0` = success; `2` = quarantined records or failed candidate validation;
 `1` = command, configuration, file, or approval error.
@@ -107,6 +121,7 @@ Live-model generation has not been tested.
 - `config.example.json`: timestamp and routing settings.
 - `es/index-template.example.json`: mapping template for emitted fields; not installed automatically.
 - [Interface reference](INTERFACE.md): implemented inputs, outputs, and Python APIs.
+- [Review updates](CHANGES.md): changes and validation compared with the original pull request.
 
-There is a problem that the module has not yet been validated against real-world data, and some parts of the code still require adjustment.
+Real connector inputs and end-to-end Elasticsearch ingestion have not yet been verified.
 

@@ -115,5 +115,5 @@ class OllamaGenerator:
             if not isinstance(proposal, dict):
                 raise SchemaError("model proposal must be a JSON object")
             return proposal
-        except (OSError, ValueError, TypeError, AttributeError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError, RecursionError) as exc:
             raise SchemaError(f"candidate generation failed: {exc}") from exc

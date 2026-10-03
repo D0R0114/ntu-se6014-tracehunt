@@ -74,17 +74,50 @@ def arguments() -> argparse.ArgumentParser:
     return parser
 
 
+def decoding_failure(source, text, issue):
+    result = {"status": "quarantined", "source": source, "schema_id": None,
+              "schema_version": None, "raw_record": None, "raw_text": text,
+              "errors": [issue.as_dict()]}
+    if issue.raw_bytes_base64 is not None:
+        result["raw_bytes_base64"] = issue.raw_bytes_base64
+    return result
+
+
+def validate_output_paths(input_name, output_names, config_name=None, registry_name=None):
+    source = Path(input_name).resolve()
+    outputs = [Path(name).resolve() for name in output_names if name]
+    if not source.is_file():
+        raise SchemaError("input file does not exist")
+
+    def same_file(first, second):
+        return first == second or (first.exists() and second.exists() and first.samefile(second))
+
+    protected = [source]
+    if config_name:
+        protected.append(Path(config_name).resolve())
+    registry_paths = [(Path(__file__).parent / "schemas").resolve()]
+    if registry_name:
+        registry_paths.append(Path(registry_name).resolve())
+        if same_file(registry_paths[-1], source):
+            raise SchemaError("registry must be a separate directory")
+    for directory in registry_paths:
+        protected.extend(directory.glob("*.json"))
+    for position, output in enumerate(outputs):
+        if any(same_file(output, item) for item in protected + outputs[:position]):
+            raise SchemaError("input, config, and output files must be distinct, including hard links")
+        if any(output.is_relative_to(directory) for directory in registry_paths):
+            raise SchemaError("output files must be outside parser registry directories")
+        if output.exists() and not output.is_file():
+            raise SchemaError("output paths must refer to files")
+    return source
+
+
 def run_normalize(args) -> int:
     if args.schema_version and not args.schema_id:
         raise SchemaError("--schema-version requires --schema-id")
     pipeline = SchemaPipeline(SchemaRegistry(args.registry), Config.load(args.config))
     output_names = [args.output, args.quarantine, args.events_output, args.bulk_output]
-    paths = [Path(name).resolve() for name in output_names if name]
-    input_path = Path(args.input).resolve()
-    if not input_path.is_file():
-        raise SchemaError("input file does not exist")
-    if input_path in paths or len(set(paths)) != len(paths):
-        raise SchemaError("input and output paths must be distinct")
+    input_path = validate_output_paths(args.input, output_names, args.config, args.registry)
     for name in (args.output, args.events_output, args.bulk_output):
         if name and Path(name).exists():
             raise SchemaError(f"output already exists; use a new run directory: {name}")
@@ -97,9 +130,7 @@ def run_normalize(args) -> int:
         for number, text, record, issue in read_ndjson(args.input):
             counts["processed"] += 1
             if issue:
-                result = {"status": "quarantined", "source": args.source, "schema_id": None,
-                          "schema_version": None, "raw_record": None, "raw_text": text,
-                          "errors": [issue.as_dict()]}
+                result = decoding_failure(args.source, text, issue)
             else:
                 result = pipeline.process(record, args.source, text, args.schema_id, args.schema_version)
             if result["status"] == "quarantined":
@@ -126,18 +157,11 @@ def run_onboard(args) -> int:
     generator = OllamaGenerator(args.model, args.model_endpoint, args.model_timeout) if args.generator == "ollama" else None
     agent = SchemaAgent(SchemaRegistry(args.registry), cfg, generator, args.max_attempts,
                         args.max_samples, args.review_only, args.frozen)
-    source = Path(args.input).resolve()
-    outputs = [Path(p).resolve() for p in (args.output, args.quarantine, args.audit,
-                                          args.events_output, args.bulk_output) if p]
-    if not source.is_file():
-        raise SchemaError("input file does not exist")
-    if source in outputs or len(set(outputs)) != len(outputs):
-        raise SchemaError("input and output paths must be distinct")
+    source = validate_output_paths(args.input, (args.output, args.quarantine, args.audit,
+                                               args.events_output, args.bulk_output), args.config, args.registry)
     for name in (args.output, args.audit, args.events_output, args.bulk_output):
         if name and Path(name).exists():
             raise SchemaError(f"output already exists; use a new run directory: {name}")
-    if Path(args.registry).resolve() in outputs or Path(args.registry).resolve() == source:
-        raise SchemaError("registry must be a separate directory")
     quarantine = QuarantineWriter(args.quarantine)
     counts = {"processed": 0, "accepted": 0, "quarantined": 0, "created_schemas": 0}
     with ExitStack() as stack:
@@ -159,9 +183,7 @@ def run_onboard(args) -> int:
             for number, text, record, issue in batch:
                 counts["processed"] += 1
                 if issue:
-                    result = {"status": "quarantined", "source": args.source,
-                              "schema_id": None, "schema_version": None,
-                              "raw_record": None, "raw_text": text, "errors": [issue.as_dict()]}
+                    result = decoding_failure(args.source, text, issue)
                     write_line(audit, {"decision": "quarantine", "states": ["decode", "quarantine"],
                                        "input_file": str(source), "line_numbers": [number],
                                        "errors": [issue.as_dict()]})
@@ -211,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                                   "review_required": True}))
             return 0 if candidate["validation"]["passed"] else 2
         if args.command == "approve":
-            candidate = decode(Path(args.candidate).read_text(encoding="utf-8"))
+            candidate = decode(Path(args.candidate).read_text(encoding="utf-8-sig"))
             samples = load_samples(args.samples)
             if not isinstance(candidate, dict) or candidate.get("status") != "candidate":
                 raise SchemaError("candidate file must contain an infer result")
@@ -228,6 +250,6 @@ def main(argv: list[str] | None = None) -> int:
         result = registry.get_schema(args.schema_id, args.schema_version) if args.schema_id else registry.list_schemas()
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
-    except (SchemaError, RecordError, OSError, ValueError, KeyError, TypeError) as exc:
+    except (SchemaError, RecordError, OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
         print(canonical_json({"status": "error", "message": str(exc)}), file=sys.stderr)
         return 1

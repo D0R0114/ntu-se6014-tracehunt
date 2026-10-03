@@ -2,10 +2,10 @@
 
 from copy import deepcopy
 
-from .classifier import classify
+from .classifier import SOURCES, classify
 from .config import Config
 from .errors import RecordError, SchemaError
-from .fields import canonical_json, digest
+from .fields import canonical_json, digest, safe_repr, validate_json_value, validate_raw_text
 from .parser import normalize
 from .registry import SchemaRegistry
 
@@ -19,19 +19,19 @@ class SchemaPipeline:
                 schema_id: str | None = None, schema_version: str | None = None) -> dict:
         source = source_hint
         spec = None
-        safe_record = record
+        safe_record = None
         try:
-            if schema_version and not schema_id:
-                raise RecordError("invalid_schema_pin", "schema_version requires schema_id")
+            try:
+                validate_json_value(record)
+                canonical_json(record)
+            except (ValueError, TypeError, RecursionError) as exc:
+                raise RecordError("invalid_record", str(exc)) from exc
+            safe_record = record
             if not isinstance(record, dict):
                 raise RecordError("invalid_record", "each event must be a JSON object")
-            try:
-                canonical_json(record)
-            except (ValueError, TypeError) as exc:
-                safe_record = None
-                if raw_text is None:
-                    raw_text = repr(record)
-                raise RecordError("invalid_record", "event must contain finite JSON values") from exc
+            validate_raw_text(raw_text)
+            if schema_version and not schema_id:
+                raise RecordError("invalid_schema_pin", "schema_version requires schema_id")
             source = classify(record, source_hint)
             if schema_id:
                 spec = self.registry.get_schema(schema_id, schema_version)
@@ -61,8 +61,15 @@ class SchemaPipeline:
         except (RecordError, SchemaError) as exc:
             issue = exc.as_dict() if isinstance(exc, RecordError) else {
                 "code": "schema_error", "field": None, "message": str(exc)}
+            if raw_text is None and safe_record is None:
+                raw_text = safe_repr(record)
+            else:
+                try:
+                    validate_raw_text(raw_text)
+                except RecordError:
+                    raw_text = safe_repr(raw_text)
             # Preserve the input text even when the input could not be decoded.
-            return {"status": "quarantined", "source": source,
+            return {"status": "quarantined", "source": source if source in SOURCES else None,
                     "schema_id": spec["id"] if spec else None,
                     "schema_version": spec["version"] if spec else None,
                     "errors": [issue], "raw_record": deepcopy(safe_record), "raw_text": raw_text}

@@ -33,7 +33,7 @@
           "request": {"properties": {"method": {"type": "keyword"}}},
           "response": {"properties": {"status_code": {"type": "long"}}}
         }},
-        "url": {"properties": {"original": {"type": "wildcard"}}},
+        "url": {"properties": {"original": {"type": "wildcard"}, "domain": {"type": "keyword"}}},
         "user_agent": {"properties": {"original": {"type": "keyword"}}},
         "network": {"properties": {"transport": {"type": "keyword"}}},
         "winlog": {"properties": {

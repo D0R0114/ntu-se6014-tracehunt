@@ -6,7 +6,8 @@ from pathlib import Path
 import re
 
 from .errors import SchemaError
-from .fields import digest, leaf_paths
+from .fields import canonical_json, digest, leaf_paths, validate_json_value, validate_record
+from .io import decode
 
 # Each supported destination has exactly one conversion contract.
 FIELD_TYPES = {
@@ -19,7 +20,7 @@ FIELD_TYPES = {
     "process.parent.executable": "keyword", "process.parent.pid": "integer",
     "process.parent.entity_id": "keyword", "dns.question.name": "keyword",
     "http.request.method": "keyword", "http.response.status_code": "integer",
-    "url.original": "text", "user_agent.original": "text",
+    "url.original": "text", "url.domain": "keyword", "user_agent.original": "text",
     "network.transport": "keyword", "winlog.logon.type": "integer",
     "winlog.event_data.Status": "keyword", "winlog.record_id": "keyword",
 }
@@ -28,13 +29,22 @@ FIELD_TYPES = {
 def validate_definition(spec: dict) -> None:
     if not isinstance(spec, dict):
         raise SchemaError("schema must be an object")
+    try:
+        validate_json_value(spec)
+        canonical_json(spec)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise SchemaError(f"schema must contain valid JSON values: {exc}") from exc
     for key in ("id", "version", "source", "dataset", "mappings", "required"):
         if key not in spec:
             raise SchemaError(f"schema is missing {key}")
     if not isinstance(spec["id"], str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,79}", spec["id"]):
         raise SchemaError("schema id must be a lowercase identifier")
-    if not isinstance(spec["version"], str) or not re.fullmatch(r"\d+\.\d+\.\d+", spec["version"]):
+    if not isinstance(spec["version"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", spec["version"]):
         raise SchemaError("schema version must have three numeric components")
+    try:
+        tuple(map(int, spec["version"].split(".")))
+    except ValueError as exc:
+        raise SchemaError("schema version components exceed the supported numeric length") from exc
     if spec["source"] not in ("windows-security", "sysmon", "zeek", "custom-json"):
         raise SchemaError("schema source is not supported")
     if not isinstance(spec["dataset"], str) or not re.fullmatch(r"[a-z][a-z0-9_.-]+", spec["dataset"]):
@@ -77,10 +87,19 @@ class SchemaRegistry:
         self._definitions: dict[tuple[str, str], dict] = {}
         builtin = Path(__file__).parent / "schemas"
         for path in sorted(builtin.glob("*.json")):
-            self._insert(json.loads(path.read_text(encoding="utf-8")))
+            self._insert(self._read_definition(path))
         if self.directory and self.directory.exists():
+            if not self.directory.is_dir():
+                raise SchemaError("registry must be a directory")
             for path in sorted(self.directory.glob("*.json")):
-                self._insert(json.loads(path.read_text(encoding="utf-8")))
+                self._insert(self._read_definition(path))
+
+    @staticmethod
+    def _read_definition(path):
+        try:
+            return decode(path.read_text(encoding="utf-8-sig"))
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise SchemaError(f"invalid schema file {path.name}: {exc}") from exc
 
     def _insert(self, spec: dict):
         validate_definition(spec)
@@ -102,6 +121,7 @@ class SchemaRegistry:
         return deepcopy(max(candidates, key=lambda s: tuple(map(int, s["version"].split(".")))))
 
     def select(self, source: str | None, record: dict) -> dict | None:
+        validate_record(record)
         signature = leaf_paths(record)
         candidates = [s for s in self._definitions.values()
                       if (source in (None, "custom-json") and s["source"] == "custom-json"
@@ -124,6 +144,8 @@ class SchemaRegistry:
             raise SchemaError("approval is for custom candidates; bundled parsers are shipped in code")
         if not samples or not all(isinstance(s, dict) for s in samples):
             raise SchemaError("approval requires non-empty JSON object samples")
+        for sample in samples:
+            validate_record(sample)
         if any(leaf_paths(s) != spec["signature"] for s in samples):
             raise SchemaError("sample field signature differs from the candidate")
         events = [normalize(s, spec, config or Config()) for s in samples]
@@ -138,7 +160,7 @@ class SchemaRegistry:
             path = self.directory / f"{spec['id']}-{spec['version']}.json"
             text = json.dumps(spec, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
             if path.exists():
-                if json.loads(path.read_text(encoding="utf-8")) != spec:
+                if self._read_definition(path) != spec:
                     raise SchemaError("an approved schema version cannot be replaced")
             else:
                 with path.open("x", encoding="utf-8") as stream:

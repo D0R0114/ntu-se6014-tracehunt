@@ -8,7 +8,7 @@
   "mappings": [
     {"target": "@timestamp", "sources": ["ts", "@timestamp", "timestamp"], "type": "timestamp"},
     {"target": "event.id", "sources": ["event.id", "uid"], "type": "keyword"},
-    {"target": "host.name", "sources": ["host.name", "host"], "type": "keyword"},
+    {"target": "host.name", "sources": ["host.name"], "type": "keyword"},
     {"target": "user.name", "sources": ["user.name", "user_name"], "type": "keyword"},
     {"target": "source.ip", "sources": ["source.ip", "id.orig_h", "src_ip"], "type": "ip"},
     {"target": "destination.ip", "sources": ["destination.ip", "id.resp_h", "dst_ip"], "type": "ip"},
@@ -19,6 +19,7 @@
     {"target": "http.request.method", "sources": ["http.request.method", "method"], "type": "keyword"},
     {"target": "http.response.status_code", "sources": ["http.response.status_code", "status_code"], "type": "integer"},
     {"target": "url.original", "sources": ["url.original", "uri"], "type": "text"},
+    {"target": "url.domain", "sources": ["url.domain"], "type": "keyword"},
     {"target": "user_agent.original", "sources": ["user_agent.original", "user_agent"], "type": "text"}
   ]
 }

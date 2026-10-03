@@ -289,7 +289,7 @@ class MappingTemplateTests(unittest.TestCase):
                 current = current[part]["properties"]
 
         pipeline = SchemaPipeline()
-        for fixture in ("known-mixed.ndjson", "winlogbeat.ndjson", "zeek.ndjson"):
+        for fixture in ("known-mixed.ndjson", "winlogbeat.ndjson", "zeek.ndjson", "sysmon-flat.ndjson"):
             for sample in load_samples(ROOT / "fixtures" / fixture):
                 result = pipeline.process(sample)
                 self.assertEqual(result["status"], "accepted")
@@ -298,6 +298,7 @@ class MappingTemplateTests(unittest.TestCase):
         self.assertEqual(mapping("user.name")["type"], "keyword")
         self.assertEqual(mapping("event.code")["type"], "keyword")
         self.assertEqual(mapping("destination.ip")["type"], "ip")
+        self.assertEqual(mapping("url.domain")["type"], "keyword")
         self.assertFalse(mapping("event.original")["index"])
 
 

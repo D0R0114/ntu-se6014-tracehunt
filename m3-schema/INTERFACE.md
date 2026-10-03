@@ -9,11 +9,16 @@ Implemented interface for **tracehunt-schema 1.0.0**. Run Python examples from
 - CLI: UTF-8 NDJSON containing one JSON object per non-empty line.
 - Supported sources: `windows-security`, `sysmon`, `zeek`, and `custom-json`.
 - `source_hint` is optional; otherwise the source is classified from record fields.
-- `raw_text` is optional and preserves the original event text exactly.
+- `raw_text` is optional; valid Unicode strings preserve the original event text exactly.
 
 Bundled parsers accept decoded Windows/Winlogbeat JSON and Zeek conn/DNS/HTTP
-JSON, including nested and dotted fields. JSON must contain finite values.
-CLI decoding rejects duplicate keys and preserves malformed lines in quarantine.
+JSON, including nested, dotted, and mixed fields. Flat Sysmon `EventID`, `Image`, and
+`CommandLine` fields can be classified without a source hint. JSON must contain
+finite values, valid Unicode, string object keys, and at most 64 levels of nesting.
+CLI decoding rejects duplicate keys. Malformed records are quarantined individually;
+later records continue through both `normalize` and `onboard`.
+Conflicting nested and dotted values for the same field are rejected. Distinctive
+source fields keep malformed known records on their bundled validation path.
 
 ## Python API
 
@@ -50,6 +55,7 @@ Agent summaries contain `processed`, `accepted`, `quarantined`, and
 activation. Review-only mode retains candidates without registration; frozen
 mode disables generation. Approved parsers remain usable in both modes.
 Invalid parser definitions raise `SchemaError`; file failures raise `OSError`.
+Registration conflicts quarantine the affected group without stopping other groups.
 
 ## Accepted result
 
@@ -78,18 +84,25 @@ and `tracehunt.schema.id`/`version`/`hash`. Unmapped fields remain in the origin
 | Emitted fields | Value type |
 |---|---|
 | `@timestamp` | UTC ISO 8601 string |
-| `event.code`, `event.id`, `host.name`, `user.name`, `user.domain` | String |
+| `event.code`, `event.id`, `host.name`, `user.name`, `user.domain` | String; Windows/Sysmon event codes are canonical non-negative decimal strings |
 | `source.ip`, `destination.ip` | Validated IP string |
 | `source.port`, `destination.port` | Integer, 0-65535 |
 | `process.executable`, `process.name`, `process.command_line`, `process.entity_id` | String |
-| `process.pid`, `process.parent.pid` | Integer |
-| `dns.question.name`, `http.request.method`, `url.original` | String |
-| `http.response.status_code` | Integer |
+| `process.pid`, `process.parent.pid` | Integer, 0 through 2^63 - 1 |
+| `dns.question.name`, `http.request.method`, `url.original`, `url.domain` | String |
+| `http.response.status_code` | Integer, 0 through 2^63 - 1 |
 
 Fields depend on the source record and parser. The full emitted-field mapping
 is in [`es/index-template.example.json`](es/index-template.example.json). `document_id` is a hash of
 the input, source, parser definition/version, ECS version, and timezone setting.
 Bulk exports use it as `_id`; plain event exports do not include routing or `_id`.
+
+For Zeek HTTP, bare `host` is the HTTP Host header and supplies `url.domain`
+without its optional port; IPv6 brackets are retained. Explicit nested or dotted
+`host.name` supplies computer metadata. Whitespace-only keyword values, including
+usernames and executable paths, are invalid; internal spaces in paths are preserved.
+Executable paths must contain a filename. All `integer` mappings use the
+non-negative signed 64-bit range; `port` mappings retain the 0-65535 range.
 
 ## Quarantined result
 
@@ -102,6 +115,17 @@ to the quarantine file. Malformed JSON has `raw_record: null` and preserves
 its original line in `raw_text`. Quarantined records are excluded from accepted
 exports. `QuarantineWriter(path).append(failure)` is also available from
 `tracehunt_schema.io` for single-process file persistence.
+
+Invalid UTF-8 lines also include `raw_bytes_base64` containing the original line
+bytes without the line ending; `raw_text` uses replacement characters for display.
+Invalid Python API values use `raw_record: null` and a textual representation
+when no original text is supplied. Representations of excessively nested inputs
+are abbreviated so the quarantine result remains serializable.
+Invalid API `raw_text` values are quarantined with an escaped textual representation.
+
+Output files must be outside bundled and custom parser registry directories.
+Input, configuration, and output files must be distinct, including hard links.
+Configuration and registry JSON readers accept UTF-8 BOMs and reject duplicate keys.
 
 ## Configuration
 

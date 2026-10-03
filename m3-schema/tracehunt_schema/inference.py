@@ -6,7 +6,7 @@ execute generated code, invent enrichment, or claim to be an LLM agent.
 
 from .config import Config
 from .errors import RecordError, SchemaError
-from .fields import digest, leaf_paths
+from .fields import digest, leaf_paths, validate_record
 from .parser import normalize
 from .registry import FIELD_TYPES, validate_definition
 
@@ -28,6 +28,8 @@ def infer_candidate(samples: list[dict], schema_id: str = "custom-json",
     config = config or Config()
     if not samples or not all(isinstance(s, dict) for s in samples):
         raise SchemaError("candidate generation requires non-empty JSON object samples")
+    for sample in samples:
+        validate_record(sample)
     signature = leaf_paths(samples[0])
     if any(leaf_paths(s) != signature for s in samples):
         raise SchemaError("use a batch with one consistent field signature")

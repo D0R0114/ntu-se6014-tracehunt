@@ -1,11 +1,12 @@
 """Streaming NDJSON input, durable quarantine, and explicit export formats."""
 
+import base64
 import json
 import os
 from pathlib import Path
 
 from .errors import RecordError, SchemaError
-from .fields import canonical_json
+from .fields import canonical_json, validate_json_value
 
 
 def _reject_constant(value):
@@ -22,13 +23,23 @@ def _unique_keys(pairs):
 
 
 def decode(text: str):
-    return json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_unique_keys)
+    value = json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_unique_keys)
+    validate_json_value(value)
+    return value
 
 
 def read_ndjson(path: str | Path):
-    with Path(path).open(encoding="utf-8-sig") as stream:
-        for line_number, text in enumerate(stream, 1):
-            text = text.rstrip("\r\n")
+    # Decode one physical line at a time: a bad byte cannot abort later records.
+    with Path(path).open("rb") as stream:
+        for line_number, raw in enumerate(stream, 1):
+            raw = raw.rstrip(b"\r\n")
+            encoding = "utf-8-sig" if line_number == 1 else "utf-8"
+            try:
+                text = raw.decode(encoding)
+            except UnicodeDecodeError as exc:
+                yield line_number, raw.decode(encoding, errors="replace"), None, RecordError(
+                    "invalid_encoding", str(exc), raw_bytes_base64=base64.b64encode(raw).decode("ascii"))
+                continue
             if not text.strip():
                 continue
             try:

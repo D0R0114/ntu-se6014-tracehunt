@@ -5,7 +5,7 @@ from copy import deepcopy
 from .classifier import classify
 from .config import Config
 from .errors import RecordError, SchemaError
-from .fields import canonical_json, digest, leaf_paths
+from .fields import digest, leaf_paths, validate_record
 from .generators import AliasGenerator, CandidateGenerator
 from .parser import normalize
 from .pipeline import SchemaPipeline
@@ -46,13 +46,11 @@ class SchemaAgent:
         decisions = []
         for position, record in enumerate(records):
             try:
-                if not isinstance(record, dict):
-                    raise RecordError("invalid_record", "each event must be a JSON object")
-                canonical_json(record)
+                validate_record(record, raw_texts[position])
                 source = classify(record, source_hint)
                 signature = leaf_paths(record)
                 groups.setdefault((source, tuple(signature)), []).append(position)
-            except (RecordError, ValueError, TypeError):
+            except (RecordError, ValueError, TypeError, RecursionError):
                 results[position] = self.pipeline.process(record, source_hint, raw_texts[position])
                 decisions.append({"decision": "quarantine", "positions": [position],
                                   "states": ["inspect", "quarantine"], "errors": results[position]["errors"]})
@@ -146,7 +144,11 @@ class SchemaAgent:
                 continue
             decision["states"].append("register")
             # I/O failures propagate, rather than claiming durable registration succeeded.
-            self.registry.approve(spec, samples, self.config)
+            try:
+                self.registry.approve(spec, samples, self.config)
+            except (SchemaError, RecordError) as exc:
+                self._fail_group(decision, results, records, raw_texts, "schema_error", str(exc))
+                continue
             decision.update(decision="created", schema_id=spec["id"], schema_version=spec["version"])
             decision["states"].append("apply")
             for p in positions:
