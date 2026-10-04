@@ -1,8 +1,7 @@
 """Build Elasticsearch DSL from typed tool arguments.
 
 The agent never sends raw DSL. It sends typed filters ({field, op, value})
-and this module translates them into a bounded bool query. Only term,
-match and exists clauses are ever produced.
+and this module translates them into bounded query bodies.
 """
 
 from __future__ import annotations
@@ -39,29 +38,35 @@ def filter_clauses(filters: list[dict]) -> list[dict]:
     return clauses
 
 
-def build_query(
-    start: datetime,
-    end: datetime,
-    filters: list[dict],
-    index: str | None = None,
-) -> dict[str, Any]:
+def build_query(start: datetime, end: datetime, filters: list[dict]) -> dict[str, Any]:
     must: list[dict] = [time_range_clause(start, end)]
     must.extend(filter_clauses(filters))
     return {"bool": {"filter": must}}
 
 
-def build_agg(agg: dict) -> dict[str, Any]:
+def build_agg(agg: dict, bucket_limit: int = 100) -> dict[str, Any]:
     if agg["kind"] == "terms":
-        return {"terms": {"field": agg["field"], "size": 100}}
+        return {"terms": {"field": agg["field"], "size": bucket_limit}}
     if agg["kind"] == "date_histogram":
-        return {"date_histogram": {"field": "@timestamp", "fixed_interval": agg["interval"]}}
+        return {
+            "date_histogram": {
+                "field": agg["field"],
+                "fixed_interval": agg["interval"],
+            }
+        }
     raise ValueError(f"unsupported agg kind {agg['kind']!r}")  # pragma: no cover
 
 
-def search_body(query: dict, size: int, sort: str = "asc") -> dict[str, Any]:
+def search_body(
+    query: dict,
+    size: int,
+    sort: str = "asc",
+    source_fields: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "query": query,
         "size": size,
         "sort": [{"@timestamp": {"order": sort}}],
-        "_source": True,
+        "_source": True if source_fields is None else source_fields,
+        "track_total_hits": True,
     }

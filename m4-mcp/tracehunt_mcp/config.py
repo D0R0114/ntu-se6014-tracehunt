@@ -1,8 +1,7 @@
 """Environment-driven configuration for the TraceHunt MCP server.
 
-All behavioural limits live here so the hunt workflow (M5) and the
-reviewers can see the guardrails in one place. Values are read from
-environment variables with the TRACEHUNT_ prefix.
+All behavioural limits live here so the hunt workflow (M5) and reviewers
+can see the guardrails in one place. Values use the TRACEHUNT_ prefix.
 """
 
 from __future__ import annotations
@@ -84,7 +83,7 @@ class Config:
             max_window_hours=_env_int("TRACEHUNT_MAX_WINDOW_HOURS", 72),
             request_timeout_s=_env_int("TRACEHUNT_REQUEST_TIMEOUT_S", 10),
             max_scan=_env_int("TRACEHUNT_MAX_SCAN", 2000),
-            max_doc_ids=_env_int("TRACEHUNT_MAX_DOC_IDS", 100),
+            max_doc_ids=_env_int("TRACEHUNT_MAX_DOC_IDS", 50),
             max_seq_steps=_env_int("TRACEHUNT_MAX_SEQ_STEPS", 5),
             max_agg_buckets=_env_int("TRACEHUNT_MAX_AGG_BUCKETS", 100),
         )

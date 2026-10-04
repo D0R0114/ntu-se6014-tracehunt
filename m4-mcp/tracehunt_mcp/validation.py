@@ -7,6 +7,7 @@ agent can correct itself.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from .config import Config
@@ -16,6 +17,7 @@ ALLOWED_FILTER_OPS = ("eq", "match", "exists")
 ALLOWED_SORT = ("asc", "desc")
 ALLOWED_AGG_KINDS = ("terms", "date_histogram")
 ALLOWED_HISTOGRAM_UNITS = ("minute", "hour", "day")
+_FIELD_RE = re.compile(r"^[A-Za-z0-9_@][A-Za-z0-9_@.\-]{0,255}$")
 
 
 def validate_index(cfg: Config, index: str) -> str:
@@ -28,7 +30,9 @@ def validate_index(cfg: Config, index: str) -> str:
 
 def parse_time(value: str, field_name: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
-        raise ToolInputError(f"{field_name} must be an ISO-8601 timestamp string, e.g. 2026-10-01T14:00:00+07:00")
+        raise ToolInputError(
+            f"{field_name} must be an ISO-8601 timestamp string, e.g. 2026-10-01T14:00:00+07:00"
+        )
     text = value.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
@@ -72,6 +76,17 @@ def validate_sort(cfg: Config, sort: str | None) -> str:
     return sort
 
 
+def validate_field_name(value: str, field_name: str = "field") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ToolInputError(f"{field_name} must be a non-empty string")
+    text = value.strip()
+    if not _FIELD_RE.fullmatch(text):
+        raise ToolInputError(
+            f"{field_name} must contain only letters, digits, '.', '-', '_', or '@' and be at most 256 chars"
+        )
+    return text
+
+
 def validate_filters(cfg: Config, filters: list[dict] | None) -> list[dict]:
     """Filters are typed: [{field, op, value}]. op is allowlisted."""
     if filters is None:
@@ -84,41 +99,31 @@ def validate_filters(cfg: Config, filters: list[dict] | None) -> list[dict]:
     for i, f in enumerate(filters):
         if not isinstance(f, dict):
             raise ToolInputError(f"filters[{i}] must be an object with field, op, value")
-        field_name = f.get("field")
+        field_name = validate_field_name(f.get("field"), f"filters[{i}].field")
         op = f.get("op", "eq")
         value = f.get("value")
-        if not isinstance(field_name, str) or not field_name or " " in field_name:
-            raise ToolInputError(f"filters[{i}].field must be a non-empty field name")
         if op not in ALLOWED_FILTER_OPS:
             raise ToolInputError(
                 f"filters[{i}].op {op!r} is not allowed. Allowed ops: {', '.join(ALLOWED_FILTER_OPS)}"
             )
         if op != "exists" and value is None:
             raise ToolInputError(f"filters[{i}].value is required for op {op!r}")
-        if op == "eq" and isinstance(value, str) and len(value) > 512:
+        if isinstance(value, str) and len(value) > 512:
             raise ToolInputError(f"filters[{i}].value is too long (max 512 chars)")
-        out.append({"field": field_name, "op": op, "value": value})
+        out.append({"field": field_name, "op": op, "value": None if op == "exists" else value})
     return out
-
-
-def validate_field_name(value: str, field_name: str = "field") -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ToolInputError(f"{field_name} must be a non-empty string")
-    if " " in value or len(value) > 256:
-        raise ToolInputError(f"{field_name} must not contain spaces and must be at most 256 chars")
-    return value.strip()
 
 
 def validate_agg(cfg: Config, kind: str, field_name: str, interval: str | None) -> dict:
     if kind not in ALLOWED_AGG_KINDS:
         raise ToolInputError(f"kind must be one of {ALLOWED_AGG_KINDS}, got {kind!r}")
-    validate_field_name(field_name, "field")
-    agg: dict = {"kind": kind, "field": field_name}
+    checked_field = validate_field_name(field_name, "field")
+    agg: dict = {"kind": kind, "field": checked_field}
     if kind == "date_histogram":
         if not interval:
             raise ToolInputError("interval is required for date_histogram, e.g. 5m, 1h, 1d")
-        unit = interval[-1] if interval else ""
-        number = interval[:-1] if interval else ""
+        unit = interval[-1]
+        number = interval[:-1]
         unit_names = {"m": "minute", "h": "hour", "d": "day"}
         if unit not in unit_names or not number.isdigit() or int(number) < 1:
             raise ToolInputError(
@@ -130,11 +135,11 @@ def validate_agg(cfg: Config, kind: str, field_name: str, interval: str | None) 
     return agg
 
 
-def validate_doc_ids(ids: list[str]) -> list[str]:
+def validate_doc_ids(cfg: Config, ids: list[str]) -> list[str]:
     if not isinstance(ids, list) or not ids:
         raise ToolInputError("doc_ids must be a non-empty list of document id strings")
-    if len(ids) > 50:
-        raise ToolInputError("at most 50 doc_ids can be fetched in one call")
+    if len(ids) > cfg.max_doc_ids:
+        raise ToolInputError(f"at most {cfg.max_doc_ids} doc_ids can be fetched in one call")
     out: list[str] = []
     for i, doc_id in enumerate(ids):
         if not isinstance(doc_id, str) or not doc_id.strip():
