@@ -146,7 +146,7 @@ def test_fetch_evidence_roundtrip(toolset):
 
 
 def test_query_history_includes_failed_calls(toolset):
-    tools, backend, ledger = tooolset
+    tools, backend, ledger = toolset
     tools.search_events("sysmon", "2026-09-30T06:00:00Z", "2026-09-30T09:00:00Z")
     with pytest.raises(ToolInputError):
         tools.search_events("*", "2026-09-30T06:00:00Z", "2026-09-30T09:00:00Z")
