@@ -1,0 +1,22 @@
+# TraceHunt MCP development stack (M4 local testing only).
+# Kept on Elasticsearch 8.12.0 to match M1's shared stack on main.
+name: tracehunt-m4-dev
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: tracehunt-m4-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - cluster.name=tracehunt-dev
+    ports:
+      - "127.0.0.1:19200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
