@@ -59,6 +59,30 @@ TRACEHUNT_ES_URL=http://127.0.0.1:19200 python dev/smoke_stdio.py
 
 The GitHub workflow `.github/workflows/m4-tests.yml` runs the unit suite, starts Elasticsearch 8.12, seeds the lab dataset, runs the real integration tests, and executes the MCP stdio smoke test.
 
+## MCP client wiring
+
+Run the server over stdio and point an MCP client at the installed `tracehunt-mcp` command. Use one `TRACEHUNT_RUN_ID` for each frozen hunt run.
+
+```json
+{
+  "mcpServers": {
+    "tracehunt": {
+      "command": "/absolute/path/to/m4-mcp/.venv/bin/tracehunt-mcp",
+      "env": {
+        "TRACEHUNT_ES_URL": "http://localhost:9200",
+        "TRACEHUNT_ES_USERNAME": "tracehunt_ro",
+        "TRACEHUNT_ES_PASSWORD": "CHANGE_ME",
+        "TRACEHUNT_INDICES": "windows-security,sysmon,zeek",
+        "TRACEHUNT_LEDGER_PATH": "/absolute/path/to/evidence/ledger.jsonl",
+        "TRACEHUNT_RUN_ID": "run-hunt-01"
+      }
+    }
+  }
+}
+```
+
+For the shared stack, use the read-only Elasticsearch account backed by `es/readonly_role.json`. Do not wire the MCP server with an administrative Elasticsearch account.
+
 ## Configuration
 
 | Variable | Default |
