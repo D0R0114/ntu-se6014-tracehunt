@@ -1,176 +1,923 @@
 param(
-    [switch]$Once
+    [switch]$Once,
+    [switch]$ResetCheckpoint,
+
+    [string]$LogstashHost = "127.0.0.1",
+    [int]$LogstashPort = 5000,
+
+    [int]$PollSeconds = 1,
+    [int]$RetryCount = 3,
+    [int]$RetryDelaySeconds = 1
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
 $inputFolder = Join-Path $PSScriptRoot "input"
-$logstashHost = "127.0.0.1"
-$logstashPort = 5000
+$stateFolder = Join-Path $PSScriptRoot "state"
+$rejectedFolder = Join-Path $PSScriptRoot "rejected"
 
-New-Item -ItemType Directory -Force -Path $inputFolder | Out-Null
+$checkpointPath = Join-Path $stateFolder "checkpoints.json"
+$rejectedPath = Join-Path $rejectedFolder "zeek_rejected.ndjson"
 
-$positions = @{}
+$m2Root = Split-Path -Parent $PSScriptRoot
+$adapterPath = Join-Path $m2Root "common\m3_adapter.ps1"
 
-$client = $null
-$stream = $null
-$writer = $null
+$script:checkpoints = @{}
 
-try {
-    Write-Host "Connecting to Logstash..."
+$script:client = $null
+$script:networkStream = $null
+$script:writer = $null
 
-    $client = New-Object System.Net.Sockets.TcpClient
-    $client.Connect($logstashHost, $logstashPort)
 
-    $stream = $client.GetStream()
+function Close-LogstashConnection {
 
-    $writer = New-Object System.IO.StreamWriter(
-        $stream,
+    if ($null -ne $script:writer) {
+        try {
+            $script:writer.Dispose()
+        }
+        catch {
+        }
+
+        $script:writer = $null
+    }
+
+    if ($null -ne $script:networkStream) {
+        try {
+            $script:networkStream.Dispose()
+        }
+        catch {
+        }
+
+        $script:networkStream = $null
+    }
+
+    if ($null -ne $script:client) {
+        try {
+            $script:client.Close()
+        }
+        catch {
+        }
+
+        $script:client = $null
+    }
+}
+
+
+function Connect-Logstash {
+
+    Close-LogstashConnection
+
+    $script:client = New-Object System.Net.Sockets.TcpClient
+
+    $script:client.Connect(
+        $LogstashHost,
+        $LogstashPort
+    )
+
+    $script:networkStream = $script:client.GetStream()
+
+    $script:writer = New-Object System.IO.StreamWriter(
+        $script:networkStream,
         [Text.UTF8Encoding]::new($false)
     )
 
-    $writer.NewLine = "`n"
-    $writer.AutoFlush = $true
+    $script:writer.NewLine = "`n"
+    $script:writer.AutoFlush = $true
+}
 
-    Write-Host "Watching Zeek JSON logs in $inputFolder"
+
+function Send-PayloadToLogstash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Payload
+    )
+
+    $lastError = $null
+
+    for (
+        $attempt = 1;
+        $attempt -le $RetryCount;
+        $attempt++
+    ) {
+        try {
+
+            if (
+                $null -eq $script:client -or
+                -not $script:client.Connected -or
+                $null -eq $script:writer
+            ) {
+                Connect-Logstash
+            }
+
+            $script:writer.WriteLine($Payload)
+            $script:writer.Flush()
+
+            return
+        }
+        catch {
+            $lastError = $_
+
+            Close-LogstashConnection
+
+            if ($attempt -lt $RetryCount) {
+
+                Write-Warning (
+                    "Logstash send failed " +
+                    "(attempt $attempt/$RetryCount). " +
+                    "Reconnecting..."
+                )
+
+                Start-Sleep `
+                    -Seconds $RetryDelaySeconds
+            }
+        }
+    }
+
+    throw (
+        "Failed to send event to Logstash after " +
+        "$RetryCount attempt(s): " +
+        $lastError.Exception.Message
+    )
+}
+
+
+function Get-PrefixSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Length
+    )
+
+    if ($Length -lt 0) {
+        throw "Hash length cannot be negative."
+    }
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fileStream = $null
+
+    try {
+        $share = (
+            [IO.FileShare]::ReadWrite -bor
+            [IO.FileShare]::Delete
+        )
+
+        $fileStream = New-Object System.IO.FileStream(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            $share
+        )
+
+        if ($Length -gt $fileStream.Length) {
+            throw (
+                "Cannot hash $Length bytes; " +
+                "file currently contains only " +
+                "$($fileStream.Length) bytes."
+            )
+        }
+
+        $buffer = New-Object byte[] 65536
+        $remaining = $Length
+
+        while ($remaining -gt 0) {
+
+            $wanted = [int][Math]::Min(
+                [long]$buffer.Length,
+                $remaining
+            )
+
+            $read = $fileStream.Read(
+                $buffer,
+                0,
+                $wanted
+            )
+
+            if ($read -le 0) {
+                throw "Unexpected end of file while hashing."
+            }
+
+            $null = $sha.TransformBlock(
+                $buffer,
+                0,
+                $read,
+                $null,
+                0
+            )
+
+            $remaining -= $read
+        }
+
+        $empty = New-Object byte[] 0
+
+        $null = $sha.TransformFinalBlock(
+            $empty,
+            0,
+            0
+        )
+
+        return (
+            [BitConverter]::ToString(
+                $sha.Hash
+            ).Replace("-", "").ToLowerInvariant()
+        )
+    }
+    finally {
+
+        if ($null -ne $fileStream) {
+            $fileStream.Dispose()
+        }
+
+        $sha.Dispose()
+    }
+}
+
+
+function Load-Checkpoints {
+
+    $script:checkpoints = @{}
+
+    if (-not (Test-Path $checkpointPath)) {
+        return
+    }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText(
+            $checkpointPath,
+            [Text.Encoding]::UTF8
+        )
+
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return
+        }
+
+        $items = @(
+            $raw |
+                ConvertFrom-Json `
+                    -ErrorAction Stop
+        )
+
+        foreach ($item in $items) {
+
+            if (
+                $null -eq $item.path -or
+                $null -eq $item.offset
+            ) {
+                throw "Invalid checkpoint record."
+            }
+
+            $script:checkpoints[[string]$item.path] =
+                [PSCustomObject]@{
+                    offset        = [long]$item.offset
+                    prefix_sha256 = [string]$item.prefix_sha256
+                }
+        }
+    }
+    catch {
+        throw (
+            "Failed to load Zeek checkpoints: " +
+            $_.Exception.Message
+        )
+    }
+}
+
+
+function Save-AllCheckpoints {
+
+    $items = @(
+        foreach (
+            $path in (
+                $script:checkpoints.Keys |
+                    Sort-Object
+            )
+        ) {
+            $checkpoint = $script:checkpoints[$path]
+
+            [ordered]@{
+                path          = $path
+                offset        = [long]$checkpoint.offset
+                prefix_sha256 = [string]$checkpoint.prefix_sha256
+                updated_at    = (
+                    Get-Date
+                ).ToUniversalTime().ToString("o")
+            }
+        }
+    )
+
+    $json = $items |
+        ConvertTo-Json `
+            -Depth 5
+
+    $tempPath = "$checkpointPath.tmp"
+
+    [System.IO.File]::WriteAllText(
+        $tempPath,
+        $json,
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    Move-Item `
+        -Path $tempPath `
+        -Destination $checkpointPath `
+        -Force
+}
+
+
+function Set-FileCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Offset
+    )
+
+    $prefixHash = Get-PrefixSha256 `
+        -Path $Path `
+        -Length $Offset
+
+    $script:checkpoints[$Path] =
+        [PSCustomObject]@{
+            offset        = $Offset
+            prefix_sha256 = $prefixHash
+        }
+
+    Save-AllCheckpoints
+}
+
+
+function Get-ValidatedCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+
+    if (
+        -not $script:checkpoints.ContainsKey(
+            $fullPath
+        )
+    ) {
+        Set-FileCheckpoint `
+            -Path $fullPath `
+            -Offset 0
+
+        return [long]0
+    }
+
+    $checkpoint = $script:checkpoints[$fullPath]
+    $offset = [long]$checkpoint.offset
+
+    $fileInfo = Get-Item `
+        -LiteralPath $fullPath `
+        -ErrorAction Stop
+
+    if ($offset -gt $fileInfo.Length) {
+
+        Write-Warning (
+            "$($fileInfo.Name) was truncated or replaced. " +
+            "Resetting its checkpoint."
+        )
+
+        Set-FileCheckpoint `
+            -Path $fullPath `
+            -Offset 0
+
+        return [long]0
+    }
+
+    if ($offset -gt 0) {
+
+        $currentPrefixHash = Get-PrefixSha256 `
+            -Path $fullPath `
+            -Length $offset
+
+        if (
+            $currentPrefixHash -ne
+            [string]$checkpoint.prefix_sha256
+        ) {
+            Write-Warning (
+                "$($fileInfo.Name) content before the " +
+                "saved checkpoint changed. " +
+                "Treating it as a replacement/rotation."
+            )
+
+            Set-FileCheckpoint `
+                -Path $fullPath `
+                -Offset 0
+
+            return [long]0
+        }
+    }
+
+    return $offset
+}
+
+
+function Get-CompleteLinesFromOffset {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Offset
+    )
+
+    $fileStream = $null
+
+    try {
+        $share = (
+            [IO.FileShare]::ReadWrite -bor
+            [IO.FileShare]::Delete
+        )
+
+        $fileStream = New-Object System.IO.FileStream(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            $share
+        )
+
+        if ($Offset -gt $fileStream.Length) {
+            throw "Saved offset is beyond the current file length."
+        }
+
+        $null = $fileStream.Seek(
+            $Offset,
+            [IO.SeekOrigin]::Begin
+        )
+
+        $remaining = $fileStream.Length - $Offset
+
+        if ($remaining -le 0) {
+            return @()
+        }
+
+        if ($remaining -gt [int]::MaxValue) {
+            throw "Unread Zeek data is too large for one scan."
+        }
+
+        $buffer = New-Object byte[] ([int]$remaining)
+
+        $totalRead = 0
+
+        while ($totalRead -lt $buffer.Length) {
+
+            $read = $fileStream.Read(
+                $buffer,
+                $totalRead,
+                $buffer.Length - $totalRead
+            )
+
+            if ($read -le 0) {
+                break
+            }
+
+            $totalRead += $read
+        }
+
+        if ($totalRead -lt $buffer.Length) {
+
+            $trimmed = New-Object byte[] $totalRead
+
+            [Array]::Copy(
+                $buffer,
+                0,
+                $trimmed,
+                0,
+                $totalRead
+            )
+
+            $buffer = $trimmed
+        }
+
+        $lines = @()
+
+        $lineStart = 0
+
+        for (
+            $i = 0;
+            $i -lt $buffer.Length;
+            $i++
+        ) {
+            # Only newline-terminated records are complete.
+            if ($buffer[$i] -ne 10) {
+                continue
+            }
+
+            $lineLength = $i - $lineStart
+
+            # Remove CR from CRLF without changing the saved byte offset.
+            if (
+                $lineLength -gt 0 -and
+                $buffer[
+                    $lineStart + $lineLength - 1
+                ] -eq 13
+            ) {
+                $textLength = $lineLength - 1
+            }
+            else {
+                $textLength = $lineLength
+            }
+
+            $lineBytes = New-Object byte[] $textLength
+
+            if ($textLength -gt 0) {
+                [Array]::Copy(
+                    $buffer,
+                    $lineStart,
+                    $lineBytes,
+                    0,
+                    $textLength
+                )
+            }
+
+            $endOffset = (
+                $Offset +
+                $i +
+                1
+            )
+
+            $lines += [PSCustomObject]@{
+                bytes      = $lineBytes
+                start      = (
+                    $Offset +
+                    $lineStart
+                )
+                end_offset = $endOffset
+            }
+
+            $lineStart = $i + 1
+        }
+
+        # Any bytes after the last newline are deliberately NOT returned.
+        # Their checkpoint is therefore not advanced. Once Zeek finishes
+        # the line and writes a newline, it will be read on the next scan.
+
+        return $lines
+    }
+    finally {
+
+        if ($null -ne $fileStream) {
+            $fileStream.Dispose()
+        }
+    }
+}
+
+
+function Write-RejectedRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FileName,
+
+        [Parameter(Mandatory = $true)]
+        [long]$ByteOffset,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Reason,
+
+        [string]$RawLine,
+
+        [string]$RawBytesBase64
+    )
+
+    $record = [ordered]@{
+        rejected_at = (
+            Get-Date
+        ).ToUniversalTime().ToString("o")
+
+        source_type = "zeek"
+        input_file  = $FileName
+        byte_offset = $ByteOffset
+        reason      = $Reason
+    }
+
+    if ($PSBoundParameters.ContainsKey("RawLine")) {
+        $record["raw_line"] = $RawLine
+    }
+
+    if (
+        $PSBoundParameters.ContainsKey(
+            "RawBytesBase64"
+        )
+    ) {
+        $record["raw_bytes_base64"] =
+            $RawBytesBase64
+    }
+
+    $json = $record |
+        ConvertTo-Json `
+            -Depth 10 `
+            -Compress
+
+    [System.IO.File]::AppendAllText(
+        $rejectedPath,
+        $json + "`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
+
+function Get-ZeekTimestamp {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Event
+    )
+
+    $tsProperty = $Event.PSObject.Properties["ts"]
+
+    if ($null -eq $tsProperty) {
+        throw "Zeek record is missing ts."
+    }
+
+    $value = $tsProperty.Value
+
+    if ($null -eq $value) {
+        throw "Zeek ts is null."
+    }
+
+    # Normal Zeek JSON: Unix epoch seconds.
+    try {
+        $epochSeconds = [Convert]::ToDouble(
+            $value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+
+        if (
+            [double]::IsNaN($epochSeconds) -or
+            [double]::IsInfinity($epochSeconds)
+        ) {
+            throw "non-finite timestamp"
+        }
+
+        return (
+            [DateTimeOffset]::FromUnixTimeMilliseconds(
+                [long]($epochSeconds * 1000)
+            ).UtcDateTime.ToString("o")
+        )
+    }
+    catch {
+        # Test fixtures may use ISO timestamps.
+        try {
+            return (
+                [DateTimeOffset]::Parse(
+                    [string]$value,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+            ).UtcDateTime.ToString("o")
+        }
+        catch {
+            throw "Invalid Zeek ts value: $value"
+        }
+    }
+}
+
+
+try {
+    if (-not (Test-Path $adapterPath)) {
+        throw "M3 adapter not found: $adapterPath"
+    }
+
+    . $adapterPath
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $inputFolder |
+        Out-Null
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $stateFolder |
+        Out-Null
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $rejectedFolder |
+        Out-Null
+
+    if ($ResetCheckpoint) {
+
+        if (Test-Path $checkpointPath) {
+            Remove-Item `
+                -LiteralPath $checkpointPath `
+                -Force
+        }
+
+        $script:checkpoints = @{}
+
+        Write-Host (
+            "Zeek checkpoints reset. " +
+            "Complete existing records will be replayed."
+        )
+    }
+    else {
+        Load-Checkpoints
+    }
+
+    Write-Host "Watching Zeek logs in $inputFolder"
 
     if ($Once) {
         Write-Host "Running one scan only."
     }
     else {
-        Write-Host "Continuous mode."
+        Write-Host (
+            "Continuous mode. Poll interval: " +
+            "$PollSeconds second(s)."
+        )
     }
 
     do {
         $files = @(
-            Get-ChildItem -Path $inputFolder -File -ErrorAction SilentlyContinue |
+            Get-ChildItem `
+                -Path $inputFolder `
+                -File `
+                -ErrorAction Stop |
             Where-Object {
-                $_.Extension -eq ".json" -or $_.Extension -eq ".log"
+                $_.Extension -ieq ".json" -or
+                $_.Extension -ieq ".log"
             }
         )
 
         foreach ($file in $files) {
 
-            if (-not $positions.ContainsKey($file.FullName)) {
-                $positions[$file.FullName] = 0
-            }
+            $fullPath = [IO.Path]::GetFullPath(
+                $file.FullName
+            )
 
-            # Read plain .NET strings so PowerShell file metadata
-            # is not attached to each line.
-            $lines = [System.IO.File]::ReadAllLines($file.FullName)
+            $offset = Get-ValidatedCheckpoint `
+                -Path $fullPath
 
-            # Handle file truncation / rotation.
-            if ($positions[$file.FullName] -gt $lines.Length) {
-                $positions[$file.FullName] = 0
-            }
+            $completeLines = @(
+                Get-CompleteLinesFromOffset `
+                    -Path $fullPath `
+                    -Offset $offset
+            )
 
-            for (
-                $i = $positions[$file.FullName];
-                $i -lt $lines.Length;
-                $i++
-            ) {
-                $rawLine = [string]$lines[$i]
+            foreach ($line in $completeLines) {
 
-                if ([string]::IsNullOrWhiteSpace($rawLine)) {
+                $rawLine = $null
+
+                try {
+                    $strictUtf8 = New-Object `
+                        System.Text.UTF8Encoding(
+                            $false,
+                            $true
+                        )
+
+                    $rawLine = $strictUtf8.GetString(
+                        [byte[]]$line.bytes
+                    )
+                }
+                catch {
+                    $base64 = [Convert]::ToBase64String(
+                        [byte[]]$line.bytes
+                    )
+
+                    Write-RejectedRecord `
+                        -FileName $file.Name `
+                        -ByteOffset $line.start `
+                        -Reason "Invalid UTF-8 Zeek record." `
+                        -RawBytesBase64 $base64
+
+                    Set-FileCheckpoint `
+                        -Path $fullPath `
+                        -Offset $line.end_offset
+
+                    Write-Warning (
+                        "Rejected invalid UTF-8 record " +
+                        "from $($file.Name) at byte " +
+                        "$($line.start)."
+                    )
+
+                    continue
+                }
+
+                if (
+                    [string]::IsNullOrWhiteSpace(
+                        $rawLine
+                    )
+                ) {
+                    Set-FileCheckpoint `
+                        -Path $fullPath `
+                        -Offset $line.end_offset
+
                     continue
                 }
 
                 try {
-                    $event = $rawLine | ConvertFrom-Json -ErrorAction Stop
+                    $event = $rawLine |
+                        ConvertFrom-Json `
+                            -ErrorAction Stop
                 }
                 catch {
-                    Write-Warning "Invalid JSON in $($file.Name) at line $($i + 1)"
+                    Write-RejectedRecord `
+                        -FileName $file.Name `
+                        -ByteOffset $line.start `
+                        -Reason (
+                            "Invalid JSON: " +
+                            $_.Exception.Message
+                        ) `
+                        -RawLine $rawLine
+
+                    Set-FileCheckpoint `
+                        -Path $fullPath `
+                        -Offset $line.end_offset
+
+                    Write-Warning (
+                        "Rejected malformed JSON from " +
+                        "$($file.Name) at byte " +
+                        "$($line.start)."
+                    )
+
                     continue
                 }
 
-                # Default timestamp if the event has no ts field.
-                $timestamp = (Get-Date).ToUniversalTime().ToString("o")
+                try {
+                    # Validate ts here so one invalid timestamp
+                    # cannot terminate the stream.
+                    $timestamp = Get-ZeekTimestamp `
+                        -Event $event
 
-                if ($null -ne $event.ts) {
+                    $normalized = Convert-ZeekEventToM3 `
+                        -Event $event `
+                        -RawLine $rawLine `
+                        -LogType $file.BaseName
 
-                    $originalTs = $event.ts
-
-                    # Real Zeek JSON uses Unix epoch seconds.
-                    if (
-                        $originalTs -isnot [string] -or
-                        [string]$originalTs -match '^\d+(\.\d+)?$'
-                    ) {
-                        $epochSeconds = [Convert]::ToDouble(
-                            $originalTs,
-                            [Globalization.CultureInfo]::InvariantCulture
-                        )
-
-                        $timestamp = [DateTimeOffset]::FromUnixTimeMilliseconds(
-                            [long]($epochSeconds * 1000)
-                        ).UtcDateTime.ToString("o")
-
-                        # Keep the original Zeek epoch value.
-                        $event | Add-Member `
-                            -NotePropertyName "ts_epoch" `
-                            -NotePropertyValue $epochSeconds `
+                    # Extra normalized time for raw-index searching.
+                    # The original Zeek ts remains unchanged at top level
+                    # for M3's Zeek parser.
+                    $normalized |
+                        Add-Member `
+                            -NotePropertyName "timestamp" `
+                            -NotePropertyValue $timestamp `
                             -Force
-                    }
-                    else {
-                        # Also allow ISO timestamps in test fixtures.
-                        $timestamp = [DateTimeOffset]::Parse(
-                            [string]$originalTs,
-                            [Globalization.CultureInfo]::InvariantCulture
-                        ).UtcDateTime.ToString("o")
-                    }
 
-                    # Existing Elasticsearch mapping expects raw_event.ts
-                    # to be a date, not Zeek epoch seconds.
-                    $event | Add-Member `
-                        -NotePropertyName "ts" `
-                        -NotePropertyValue $timestamp `
-                        -Force
+                    $payload = $normalized |
+                        ConvertTo-Json `
+                            -Depth 20 `
+                            -Compress
+                }
+                catch {
+                    Write-RejectedRecord `
+                        -FileName $file.Name `
+                        -ByteOffset $line.start `
+                        -Reason $_.Exception.Message `
+                        -RawLine $rawLine
+
+                    Set-FileCheckpoint `
+                        -Path $fullPath `
+                        -Offset $line.end_offset
+
+                    Write-Warning (
+                        "Rejected Zeek record from " +
+                        "$($file.Name) at byte " +
+                        "$($line.start)`: " +
+                        $_.Exception.Message
+                    )
+
+                    continue
                 }
 
-                $payloadObject = [ordered]@{
-                    timestamp   = $timestamp
-                    event_id    = 0
-                    provider    = "Zeek"
-                    computer    = $env:COMPUTERNAME
-                    source_type = "zeek"
-                    zeek_log    = $file.BaseName
+                # If sending fails, this throws and the checkpoint is NOT
+                # advanced. The same record will therefore be retried.
+                Send-PayloadToLogstash `
+                    -Payload $payload
 
-                    # Exact unmodified line produced by Zeek.
-                    raw_line    = $rawLine
+                Set-FileCheckpoint `
+                    -Path $fullPath `
+                    -Offset $line.end_offset
 
-                    # Parsed copy for downstream schema/search work.
-                    raw_event   = $event
-                }
-
-                $payload = $payloadObject |
-                    ConvertTo-Json -Depth 10 -Compress
-
-                $writer.WriteLine($payload)
-
-                Write-Host "Sent Zeek event from $($file.Name)"
+                Write-Host (
+                    "Sent Zeek event from " +
+                    "$($file.Name), checkpoint " +
+                    "$($line.end_offset)"
+                )
             }
-
-            $positions[$file.FullName] = $lines.Length
         }
 
         if (-not $Once) {
-            Start-Sleep -Seconds 1
+            Start-Sleep `
+                -Seconds $PollSeconds
         }
 
     } while (-not $Once)
+
+    Write-Host "Zeek streaming run completed."
+}
+catch {
+    Write-Error (
+        "Zeek stream failed: " +
+        $_.Exception.Message
+    )
+
+    exit 1
 }
 finally {
-    if ($null -ne $writer) {
-        $writer.Flush()
-        $writer.Dispose()
-    }
-
-    if ($null -ne $stream) {
-        $stream.Dispose()
-    }
-
-    if ($null -ne $client) {
-        $client.Close()
-    }
+    Close-LogstashConnection
 }
-
-Write-Host "Zeek streaming run completed."
