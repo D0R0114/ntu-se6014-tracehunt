@@ -236,6 +236,11 @@ Run-Test "Zeek rotation-during-send execution" {
         -TestFile "zeek_rotation_during_send.ps1"
 }
 
+Run-Test "Zeek pre-snapshot rotation execution" {
+    Invoke-ExecutionTest `
+        -TestFile "zeek_pre_snapshot_rotation_execution.ps1"
+}
+
 Run-Test "Windows sample execution" {
     Invoke-ExecutionTest `
         -TestFile "windows_sample_execution.ps1"

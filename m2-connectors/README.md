@@ -110,20 +110,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 Expected result:
 
 ```text
-Passed: 7
+Passed: 8
 Failed: 0
 ```
 
 The suite includes executable connector regression tests for the reviewer-reproduced edge cases.
 
-### Sysmon reset and idle poll
+### Sysmon reset, generation change, and idle poll
 
 The test starts with a persisted checkpoint of RecordId 20 and simulates a recreated event log containing RecordIds 1, 2, and 3.
 
 Expected result:
 
-- RecordIds 1, 2, and 3 are sent.
-- The checkpoint advances to 3.
+- RecordIds 1, 2, and 3 are sent after a simple reset from checkpoint 20.
+- A new log generation containing RecordIds 1 through 25 is detected even when its highest RecordId exceeds the old checkpoint.
+- All RecordIds 1 through 25 are sent and the checkpoint advances to 25.
+- Checkpoints include an event fingerprint to distinguish log generations.
 - `NoMatchingEventsFound` is treated as an idle poll and exits with code 0.
 - A genuine `Get-WinEvent` failure exits with code 1.
 
@@ -137,6 +139,8 @@ Expected result:
 - After restart, 100 NEW records are sent.
 - Both connector runs exit with code 0.
 - The replacement generation is not skipped.
+- A replacement occurring after checkpoint lookup but before snapshot open is also detected.
+- In that pre-snapshot replacement case, all 100 NEW records are sent starting from `NEW0001`.
 
 ### Windows sample execution
 

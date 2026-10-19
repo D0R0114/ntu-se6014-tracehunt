@@ -24,6 +24,43 @@ function Assert-Sequence {
     }
 }
 
+function Assert-True {
+    param(
+        [bool]$Condition,
+        [string]$Message
+    )
+
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
+function Get-Sha256Hex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+        $Text
+    )
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hash = $sha.ComputeHash($bytes)
+
+        return (
+            [BitConverter]::ToString(
+                $hash
+            ).Replace("-", "").ToLowerInvariant()
+        )
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
 function Start-TcpRecorder {
     param(
         [Parameter(Mandatory = $true)]
@@ -53,7 +90,7 @@ function Start-TcpRecorder {
             $listener.Start()
 
             $lines = New-Object System.Collections.Generic.List[string]
-            $deadline = [DateTime]::UtcNow.AddSeconds(12)
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
 
             while (
                 $lines.Count -lt $ExpectedLines -and
@@ -104,18 +141,34 @@ function Start-TcpRecorder {
 }
 
 function Receive-RecorderResult {
-    param($Job)
+    param(
+        [Parameter(Mandatory = $true)]
+        $Job
+    )
 
-    $null = Wait-Job -Job $Job -Timeout 20
+    $null = Wait-Job `
+        -Job $Job `
+        -Timeout 25
 
     if ($Job.State -eq "Running") {
-        Stop-Job -Job $Job
-        Remove-Job -Job $Job
+        Stop-Job `
+            -Job $Job `
+            -ErrorAction SilentlyContinue
+
+        Remove-Job `
+            -Job $Job `
+            -Force `
+            -ErrorAction SilentlyContinue
+
         throw "TCP recorder timed out."
     }
 
     $result = Receive-Job -Job $Job
-    Remove-Job -Job $Job
+
+    Remove-Job `
+        -Job $Job `
+        -Force `
+        -ErrorAction SilentlyContinue
 
     if ($null -eq $result) {
         throw "TCP recorder returned no result."
@@ -136,7 +189,12 @@ param(
     [string]$ConnectorPath,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet("reset", "empty", "failure")]
+    [ValidateSet(
+        "reset",
+        "reset25",
+        "empty",
+        "failure"
+    )]
     [string]$Mode,
 
     [int]$Port = 0
@@ -147,7 +205,9 @@ $ErrorActionPreference = "Stop"
 function New-FakeSysmonEvent {
     param(
         [Parameter(Mandatory = $true)]
-        [long]$RecordId
+        [long]$RecordId,
+
+        [string]$Generation = "NEW"
     )
 
     $xml = @"
@@ -162,10 +222,10 @@ function New-FakeSysmonEvent {
 </System>
 <EventData>
 <Data Name='UtcTime'>2026-10-19 08:00:00.000</Data>
-<Data Name='ProcessGuid'>{TEST-$RecordId}</Data>
+<Data Name='ProcessGuid'>{${Generation}-$RecordId}</Data>
 <Data Name='ProcessId'>$RecordId</Data>
 <Data Name='Image'>C:\Windows\System32\cmd.exe</Data>
-<Data Name='CommandLine'>cmd.exe /c echo $RecordId</Data>
+<Data Name='CommandLine'>cmd.exe /c echo $Generation-$RecordId</Data>
 <Data Name='User'>TEST\user</Data>
 <Data Name='ParentProcessId'>100</Data>
 <Data Name='ParentImage'>C:\Windows\explorer.exe</Data>
@@ -207,6 +267,16 @@ function Get-WinEvent {
                 New-FakeSysmonEvent -RecordId 1
                 New-FakeSysmonEvent -RecordId 2
                 New-FakeSysmonEvent -RecordId 3
+            )
+        }
+
+        "reset25" {
+            return @(
+                for ($i = 1; $i -le 25; $i++) {
+                    New-FakeSysmonEvent `
+                        -RecordId $i `
+                        -Generation "NEW"
+                }
             )
         }
 
@@ -288,22 +358,56 @@ function Invoke-Harness {
     return [int]$process.ExitCode
 }
 
-$m2Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+function New-OldGenerationEvent20Xml {
+    return @"
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>
+<System>
+<Provider Name='Microsoft-Windows-Sysmon'/>
+<EventID>1</EventID>
+<TimeCreated SystemTime='2026-10-19T07:00:00.0000000Z'/>
+<EventRecordID>20</EventRecordID>
+<Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+<Computer>RESET-PC</Computer>
+</System>
+<EventData>
+<Data Name='UtcTime'>2026-10-19 07:00:00.000</Data>
+<Data Name='ProcessGuid'>{OLD-20}</Data>
+<Data Name='ProcessId'>20</Data>
+<Data Name='Image'>C:\Windows\System32\cmd.exe</Data>
+<Data Name='CommandLine'>cmd.exe /c echo OLD-20</Data>
+<Data Name='User'>TEST\user</Data>
+<Data Name='ParentProcessId'>100</Data>
+<Data Name='ParentImage'>C:\Windows\explorer.exe</Data>
+</EventData>
+</Event>
+"@
+}
 
-$pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+$m2Root = (
+    Resolve-Path (
+        Join-Path $PSScriptRoot ".."
+    )
+).Path
+
+$pwsh = Get-Command `
+    pwsh `
+    -ErrorAction SilentlyContinue
 
 if ($null -ne $pwsh) {
     $shellPath = $pwsh.Source
 }
 else {
     $shellPath = (
-        Get-Command powershell.exe -ErrorAction Stop
+        Get-Command `
+            powershell.exe `
+            -ErrorAction Stop
     ).Source
 }
 
 $tempRoot = Join-Path `
     ([IO.Path]::GetTempPath()) `
-    ("tracehunt-sysmon-reset-" + [Guid]::NewGuid().ToString("N"))
+    ("tracehunt-sysmon-reset-" +
+        [Guid]::NewGuid().ToString("N"))
 
 try {
     New-Item `
@@ -312,18 +416,34 @@ try {
         -Path $tempRoot |
         Out-Null
 
-    $testM2Root = Join-Path $tempRoot "m2-connectors"
+    $testM2Root = Join-Path `
+        $tempRoot `
+        "m2-connectors"
 
     Copy-Item `
         -Path $m2Root `
         -Destination $testM2Root `
         -Recurse
 
-    $sysmonRoot = Join-Path $testM2Root "sysmon-push"
-    $stateFolder = Join-Path $sysmonRoot "state"
-    $checkpointPath = Join-Path $stateFolder "checkpoint.json"
-    $connectorPath = Join-Path $sysmonRoot "sysmon_push.ps1"
-    $harnessPath = Join-Path $tempRoot "sysmon_mock_harness.ps1"
+    $sysmonRoot = Join-Path `
+        $testM2Root `
+        "sysmon-push"
+
+    $stateFolder = Join-Path `
+        $sysmonRoot `
+        "state"
+
+    $checkpointPath = Join-Path `
+        $stateFolder `
+        "checkpoint.json"
+
+    $connectorPath = Join-Path `
+        $sysmonRoot `
+        "sysmon_push.ps1"
+
+    $harnessPath = Join-Path `
+        $tempRoot `
+        "sysmon_mock_harness.ps1"
 
     New-Item `
         -ItemType Directory `
@@ -331,16 +451,19 @@ try {
         -Path $stateFolder |
         Out-Null
 
-    Write-MockHarness -Path $harnessPath
+    Write-MockHarness `
+        -Path $harnessPath
 
-    # -----------------------------------------------------------------
-    # Case 1: old checkpoint 20, recreated log now contains IDs 1,2,3.
-    # All three must be sent and the checkpoint must end at 3.
-    # -----------------------------------------------------------------
+    # ================================================================
+    # Case 1
+    # Legacy checkpoint 20, recreated log contains only IDs 1,2,3.
+    # ================================================================
     $checkpoint20 = [ordered]@{
         last_record_id = 20
         updated_at     = "2026-10-19T07:00:00.0000000Z"
-    } | ConvertTo-Json -Compress
+    } |
+        ConvertTo-Json `
+            -Compress
 
     [IO.File]::WriteAllText(
         $checkpointPath,
@@ -348,13 +471,24 @@ try {
         [Text.UTF8Encoding]::new($false)
     )
 
-    $port = Get-Random -Minimum 25000 -Maximum 45000
-    $receiver = Start-TcpRecorder -Port $port
+    $port = Get-Random `
+        -Minimum 25000 `
+        -Maximum 45000
 
-    Start-Sleep -Milliseconds 700
+    $receiver = Start-TcpRecorder `
+        -Port $port `
+        -ExpectedLines 3
 
-    $resetOut = Join-Path $tempRoot "reset.stdout.txt"
-    $resetErr = Join-Path $tempRoot "reset.stderr.txt"
+    Start-Sleep `
+        -Milliseconds 700
+
+    $resetOut = Join-Path `
+        $tempRoot `
+        "reset.stdout.txt"
+
+    $resetErr = Join-Path `
+        $tempRoot `
+        "reset.stderr.txt"
 
     $resetExit = Invoke-Harness `
         -ShellPath $shellPath `
@@ -365,14 +499,28 @@ try {
         -StdoutPath $resetOut `
         -StderrPath $resetErr
 
-    $capture = Receive-RecorderResult -Job $receiver
+    $capture = Receive-RecorderResult `
+        -Job $receiver
 
-    Assert-Equal $resetExit 0 "Reset case exit code"
-    Assert-Equal @($capture.lines).Count 3 "Reset case sent count"
+    Assert-Equal `
+        $resetExit `
+        0 `
+        "Reset case exit code"
+
+    Assert-Equal `
+        @($capture.lines).Count `
+        3 `
+        "Reset case sent count"
+
+    Assert-True `
+        (-not $capture.timed_out) `
+        "Reset case TCP recorder timed out."
 
     $recordIds = @(
         foreach ($line in @($capture.lines)) {
-            $payload = $line | ConvertFrom-Json
+            $payload = $line |
+                ConvertFrom-Json
+
             [long]$payload.winlog.record_id
         }
     )
@@ -382,22 +530,161 @@ try {
         -Expected @(1, 2, 3) `
         -Message "Reset case sent RecordIds"
 
-    $checkpointAfterReset = [IO.File]::ReadAllText(
-        $checkpointPath,
-        [Text.Encoding]::UTF8
-    ) | ConvertFrom-Json
+    $checkpointAfterReset = (
+        [IO.File]::ReadAllText(
+            $checkpointPath,
+            [Text.Encoding]::UTF8
+        ) |
+            ConvertFrom-Json
+    )
 
     Assert-Equal `
         $checkpointAfterReset.last_record_id `
         3 `
         "Checkpoint after event-log reset"
 
-    # -----------------------------------------------------------------
-    # Case 2: NoMatchingEventsFound is a normal idle poll.
-    # It must exit 0 and preserve the checkpoint.
-    # -----------------------------------------------------------------
-    $emptyOut = Join-Path $tempRoot "empty.stdout.txt"
-    $emptyErr = Join-Path $tempRoot "empty.stderr.txt"
+    Assert-True `
+        (
+            -not [string]::IsNullOrWhiteSpace(
+                [string]$checkpointAfterReset.last_record_sha256
+            )
+        ) `
+        "Checkpoint fingerprint missing after reset"
+
+    # ================================================================
+    # Case 2
+    # Strong generation test:
+    #
+    # Persisted checkpoint belongs to OLD generation at RecordId 20.
+    # NEW generation already contains RecordIds 1..25.
+    #
+    # A RecordId-only implementation would incorrectly send 21..25.
+    # Fingerprint generation detection must replay ALL 1..25.
+    # ================================================================
+    $oldEvent20Xml =
+        New-OldGenerationEvent20Xml
+
+    $oldEvent20Hash =
+        Get-Sha256Hex `
+            -Text $oldEvent20Xml
+
+    $checkpointOldGeneration = [ordered]@{
+        last_record_id      = 20
+        last_record_sha256  = $oldEvent20Hash
+        last_event_time_utc = "2026-10-19T07:00:00.0000000Z"
+        updated_at          = "2026-10-19T07:00:01.0000000Z"
+    } |
+        ConvertTo-Json `
+            -Compress
+
+    [IO.File]::WriteAllText(
+        $checkpointPath,
+        $checkpointOldGeneration,
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    $port25 = Get-Random `
+        -Minimum 25000 `
+        -Maximum 45000
+
+    $receiver25 = Start-TcpRecorder `
+        -Port $port25 `
+        -ExpectedLines 25
+
+    Start-Sleep `
+        -Milliseconds 700
+
+    $reset25Out = Join-Path `
+        $tempRoot `
+        "reset25.stdout.txt"
+
+    $reset25Err = Join-Path `
+        $tempRoot `
+        "reset25.stderr.txt"
+
+    $reset25Exit = Invoke-Harness `
+        -ShellPath $shellPath `
+        -HarnessPath $harnessPath `
+        -ConnectorPath $connectorPath `
+        -Mode "reset25" `
+        -Port $port25 `
+        -StdoutPath $reset25Out `
+        -StderrPath $reset25Err
+
+    $capture25 = Receive-RecorderResult `
+        -Job $receiver25
+
+    Assert-Equal `
+        $reset25Exit `
+        0 `
+        "Generation-reset 1..25 exit code"
+
+    Assert-True `
+        (-not $capture25.timed_out) `
+        "Generation-reset 1..25 TCP recorder timed out."
+
+    Assert-Equal `
+        @($capture25.lines).Count `
+        25 `
+        "Generation-reset 1..25 sent count"
+
+    $recordIds25 = @(
+        foreach ($line in @($capture25.lines)) {
+            $payload = $line |
+                ConvertFrom-Json
+
+            [long]$payload.winlog.record_id
+        }
+    )
+
+    $expectedIds25 = @(
+        1..25
+    )
+
+    Assert-Sequence `
+        -Actual $recordIds25 `
+        -Expected $expectedIds25 `
+        -Message "Generation-reset 1..25 sent RecordIds"
+
+    $checkpointAfter25 = (
+        [IO.File]::ReadAllText(
+            $checkpointPath,
+            [Text.Encoding]::UTF8
+        ) |
+            ConvertFrom-Json
+    )
+
+    Assert-Equal `
+        $checkpointAfter25.last_record_id `
+        25 `
+        "Checkpoint after generation-reset 1..25"
+
+    Assert-True `
+        (
+            -not [string]::IsNullOrWhiteSpace(
+                [string]$checkpointAfter25.last_record_sha256
+            )
+        ) `
+        "Generation-reset checkpoint fingerprint missing"
+
+    Assert-True `
+        (
+            [string]$checkpointAfter25.last_record_sha256 -ne
+            $oldEvent20Hash
+        ) `
+        "Generation-reset checkpoint still contains OLD fingerprint"
+
+    # ================================================================
+    # Case 3
+    # NoMatchingEventsFound is a normal idle poll.
+    # ================================================================
+    $emptyOut = Join-Path `
+        $tempRoot `
+        "empty.stdout.txt"
+
+    $emptyErr = Join-Path `
+        $tempRoot `
+        "empty.stderr.txt"
 
     $emptyExit = Invoke-Harness `
         -ShellPath $shellPath `
@@ -408,23 +695,35 @@ try {
         -StdoutPath $emptyOut `
         -StderrPath $emptyErr
 
-    Assert-Equal $emptyExit 0 "NoMatchingEventsFound exit code"
+    Assert-Equal `
+        $emptyExit `
+        0 `
+        "NoMatchingEventsFound exit code"
 
-    $checkpointAfterEmpty = [IO.File]::ReadAllText(
-        $checkpointPath,
-        [Text.Encoding]::UTF8
-    ) | ConvertFrom-Json
+    $checkpointAfterEmpty = (
+        [IO.File]::ReadAllText(
+            $checkpointPath,
+            [Text.Encoding]::UTF8
+        ) |
+            ConvertFrom-Json
+    )
 
     Assert-Equal `
         $checkpointAfterEmpty.last_record_id `
-        3 `
+        25 `
         "Idle poll must preserve checkpoint"
 
-    # -----------------------------------------------------------------
-    # Case 3: a genuine Get-WinEvent read failure remains visible.
-    # -----------------------------------------------------------------
-    $failureOut = Join-Path $tempRoot "failure.stdout.txt"
-    $failureErr = Join-Path $tempRoot "failure.stderr.txt"
+    # ================================================================
+    # Case 4
+    # Genuine Get-WinEvent failure remains visible.
+    # ================================================================
+    $failureOut = Join-Path `
+        $tempRoot `
+        "failure.stdout.txt"
+
+    $failureErr = Join-Path `
+        $tempRoot `
+        "failure.stderr.txt"
 
     $failureExit = Invoke-Harness `
         -ShellPath $shellPath `
@@ -435,18 +734,27 @@ try {
         -StdoutPath $failureOut `
         -StderrPath $failureErr
 
-    Assert-Equal $failureExit 1 "Real read failure exit code"
+    Assert-Equal `
+        $failureExit `
+        1 `
+        "Real read failure exit code"
 
-    Write-Host "[PASS] Sysmon reset and empty-poll execution tests"
-    Write-Host "Reset sent RecordIds: 1,2,3"
-    Write-Host "Checkpoint after reset: 3"
+    Write-Host (
+        "[PASS] Sysmon reset, generation, " +
+        "and empty-poll execution tests"
+    )
+
+    Write-Host "Simple reset sent RecordIds: 1,2,3"
+    Write-Host "Generation reset sent RecordIds: 1..25"
+    Write-Host "Checkpoint after generation reset: 25"
     Write-Host "NoMatchingEventsFound exit: 0"
     Write-Host "Real read failure exit: 1"
+
     exit 0
 }
 catch {
     Write-Host (
-        "[FAIL] Sysmon reset and empty-poll execution tests - " +
+        "[FAIL] Sysmon reset/generation execution tests - " +
         $_.Exception.Message
     )
 

@@ -25,9 +25,76 @@ $rejectedFolder = Join-Path $PSScriptRoot "rejected"
 $rejectedPath = Join-Path $rejectedFolder "sysmon_rejected.ndjson"
 
 
+function Get-Sha256Hex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+        $Text
+    )
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hash = $sha.ComputeHash($bytes)
+
+        return (
+            [BitConverter]::ToString(
+                $hash
+            ).Replace("-", "").ToLowerInvariant()
+        )
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+
+function Get-EventFingerprint {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Event
+    )
+
+    $xml = $Event.ToXml()
+
+    if ([string]::IsNullOrWhiteSpace([string]$xml)) {
+        throw "Cannot fingerprint an event with empty XML."
+    }
+
+    return Get-Sha256Hex -Text ([string]$xml)
+}
+
+
+function Get-EventTimeUtc {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Event
+    )
+
+    if ($null -eq $Event.TimeCreated) {
+        return $null
+    }
+
+    return $Event.TimeCreated.
+        ToUniversalTime().
+        ToString("o")
+}
+
+
 function Read-Checkpoint {
+
+    $emptyCheckpoint = [PSCustomObject]@{
+        last_record_id       = [long]0
+        last_record_sha256   = $null
+        last_event_time_utc  = $null
+        updated_at           = $null
+    }
+
     if (-not (Test-Path $checkpointPath)) {
-        return [long]0
+        return $emptyCheckpoint
     }
 
     try {
@@ -37,7 +104,7 @@ function Read-Checkpoint {
         )
 
         if ([string]::IsNullOrWhiteSpace($content)) {
-            return [long]0
+            return $emptyCheckpoint
         }
 
         $checkpoint = $content |
@@ -48,7 +115,45 @@ function Read-Checkpoint {
             throw "Checkpoint does not contain last_record_id."
         }
 
-        return [long]$checkpoint.last_record_id
+        $shaProperty = $checkpoint.PSObject.Properties[
+            "last_record_sha256"
+        ]
+
+        if ($null -ne $shaProperty) {
+            $recordSha256 = [string]$shaProperty.Value
+        }
+        else {
+            $recordSha256 = $null
+        }
+
+        $eventTimeProperty = $checkpoint.PSObject.Properties[
+            "last_event_time_utc"
+        ]
+
+        if ($null -ne $eventTimeProperty) {
+            $eventTimeUtc = [string]$eventTimeProperty.Value
+        }
+        else {
+            $eventTimeUtc = $null
+        }
+
+        $updatedProperty = $checkpoint.PSObject.Properties[
+            "updated_at"
+        ]
+
+        if ($null -ne $updatedProperty) {
+            $updatedAt = [string]$updatedProperty.Value
+        }
+        else {
+            $updatedAt = $null
+        }
+
+        return [PSCustomObject]@{
+            last_record_id       = [long]$checkpoint.last_record_id
+            last_record_sha256   = $recordSha256
+            last_event_time_utc  = $eventTimeUtc
+            updated_at           = $updatedAt
+        }
     }
     catch {
         throw "Failed to read checkpoint: $($_.Exception.Message)"
@@ -59,15 +164,38 @@ function Read-Checkpoint {
 function Save-Checkpoint {
     param(
         [Parameter(Mandatory = $true)]
-        [long]$RecordId
+        [long]$RecordId,
+
+        [string]$RecordSha256,
+
+        [string]$EventTimeUtc
     )
 
     $checkpointObject = [ordered]@{
         last_record_id = $RecordId
-        updated_at     = (
-            Get-Date
-        ).ToUniversalTime().ToString("o")
     }
+
+    if (
+        -not [string]::IsNullOrWhiteSpace(
+            $RecordSha256
+        )
+    ) {
+        $checkpointObject["last_record_sha256"] =
+            $RecordSha256
+    }
+
+    if (
+        -not [string]::IsNullOrWhiteSpace(
+            $EventTimeUtc
+        )
+    ) {
+        $checkpointObject["last_event_time_utc"] =
+            $EventTimeUtc
+    }
+
+    $checkpointObject["updated_at"] = (
+        Get-Date
+    ).ToUniversalTime().ToString("o")
 
     $json = $checkpointObject |
         ConvertTo-Json `
@@ -216,7 +344,8 @@ function Test-IsNoMatchingEventsError {
         $ErrorRecord
     )
 
-    $fullyQualifiedErrorId = [string]$ErrorRecord.FullyQualifiedErrorId
+    $fullyQualifiedErrorId =
+        [string]$ErrorRecord.FullyQualifiedErrorId
 
     if (
         $fullyQualifiedErrorId -like
@@ -225,7 +354,8 @@ function Test-IsNoMatchingEventsError {
         return $true
     }
 
-    $message = [string]$ErrorRecord.Exception.Message
+    $message =
+        [string]$ErrorRecord.Exception.Message
 
     if (
         $message -match
@@ -238,18 +368,173 @@ function Test-IsNoMatchingEventsError {
 }
 
 
+function Test-CheckpointGeneration {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$AvailableEvents,
+
+        [Parameter(Mandatory = $true)]
+        $Checkpoint
+    )
+
+    $checkpointId =
+        [long]$Checkpoint.last_record_id
+
+    if ($checkpointId -le 0) {
+        return [PSCustomObject]@{
+            reset_detected = $false
+            reason         = $null
+        }
+    }
+
+    if ($AvailableEvents.Count -eq 0) {
+        return [PSCustomObject]@{
+            reset_detected = $false
+            reason         = $null
+        }
+    }
+
+    $highestRecordId =
+        [long]$AvailableEvents[-1].RecordId
+
+    if ($highestRecordId -lt $checkpointId) {
+        return [PSCustomObject]@{
+            reset_detected = $true
+            reason         = (
+                "current highest RecordId $highestRecordId " +
+                "is below checkpoint $checkpointId"
+            )
+        }
+    }
+
+    $checkpointEvent = @(
+        $AvailableEvents |
+        Where-Object {
+            [long]$_.RecordId -eq $checkpointId
+        }
+    ) |
+        Select-Object -First 1
+
+    $savedHash =
+        [string]$Checkpoint.last_record_sha256
+
+    if (
+        -not [string]::IsNullOrWhiteSpace(
+            $savedHash
+        )
+    ) {
+        if ($null -ne $checkpointEvent) {
+            $currentHash = Get-EventFingerprint `
+                -Event $checkpointEvent
+
+            if ($currentHash -ne $savedHash) {
+                return [PSCustomObject]@{
+                    reset_detected = $true
+                    reason         = (
+                        "checkpoint RecordId $checkpointId " +
+                        "now refers to a different event"
+                    )
+                }
+            }
+
+            return [PSCustomObject]@{
+                reset_detected = $false
+                reason         = $null
+            }
+        }
+
+        $hasLowerRecord = @(
+            $AvailableEvents |
+            Where-Object {
+                [long]$_.RecordId -lt $checkpointId
+            }
+        ).Count -gt 0
+
+        $hasHigherRecord = @(
+            $AvailableEvents |
+            Where-Object {
+                [long]$_.RecordId -gt $checkpointId
+            }
+        ).Count -gt 0
+
+        # If records from both sides of the saved checkpoint still
+        # exist but the exact checkpoint event disappeared, this cannot
+        # be explained by normal oldest-first log retention. Treat the
+        # snapshot as a different generation.
+        if (
+            $hasLowerRecord -and
+            $hasHigherRecord
+        ) {
+            return [PSCustomObject]@{
+                reset_detected = $true
+                reason         = (
+                    "records exist below and above checkpoint " +
+                    "$checkpointId but its fingerprint anchor is absent"
+                )
+            }
+        }
+
+        return [PSCustomObject]@{
+            reset_detected = $false
+            reason         = $null
+        }
+    }
+
+    # Backward compatibility for checkpoints written by older versions.
+    #
+    # Old checkpoints do not contain a fingerprint. If the event with the
+    # same RecordId exists but was created after the checkpoint file was
+    # written, it must belong to a recreated/newer log generation.
+    $savedUpdatedAt =
+        [string]$Checkpoint.updated_at
+
+    if (
+        $null -ne $checkpointEvent -and
+        -not [string]::IsNullOrWhiteSpace(
+            $savedUpdatedAt
+        ) -and
+        $null -ne $checkpointEvent.TimeCreated
+    ) {
+        try {
+            $checkpointWritten =
+                [DateTimeOffset]::Parse(
+                    $savedUpdatedAt,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+
+            $eventCreated =
+                [DateTimeOffset]$checkpointEvent.TimeCreated
+
+            if ($eventCreated -gt $checkpointWritten) {
+                return [PSCustomObject]@{
+                    reset_detected = $true
+                    reason         = (
+                        "legacy checkpoint RecordId $checkpointId " +
+                        "now refers to an event created after the " +
+                        "checkpoint was written"
+                    )
+                }
+            }
+        }
+        catch {
+            # If legacy timestamp parsing fails, keep the conservative
+            # RecordId behavior rather than aborting ingestion.
+        }
+    }
+
+    return [PSCustomObject]@{
+        reset_detected = $false
+        reason         = $null
+    }
+}
+
+
 function Get-SysmonPollResult {
     param(
         [Parameter(Mandatory = $true)]
-        [long]$AfterRecordId
+        $Checkpoint
     )
 
-    # Read the complete Event ID 1 snapshot first.
-    #
-    # We deliberately do not use -MaxEvents here. Besides avoiding burst
-    # loss, the snapshot lets us recognise the reviewer-reproduced reset
-    # case where the persisted checkpoint belongs to an older log
-    # generation (for example checkpoint 20, current records 1..3).
     try {
         $availableEvents = @(
             Get-WinEvent `
@@ -267,14 +552,13 @@ function Get-SysmonPollResult {
             Test-IsNoMatchingEventsError `
                 -ErrorRecord $_
         ) {
-            # An empty Event ID 1 selection is a normal idle poll.
             return [PSCustomObject]@{
                 events         = @()
                 reset_detected = $false
+                reset_reason   = $null
             }
         }
 
-        # Any other Get-WinEvent failure remains visible to the caller.
         throw
     }
 
@@ -282,37 +566,34 @@ function Get-SysmonPollResult {
         return [PSCustomObject]@{
             events         = @()
             reset_detected = $false
+            reset_reason   = $null
         }
     }
 
-    $highestRecordId = [long](
-        $availableEvents[-1].RecordId
-    )
+    $generationResult =
+        Test-CheckpointGeneration `
+            -AvailableEvents $availableEvents `
+            -Checkpoint $Checkpoint
 
-    $resetDetected = (
-        $AfterRecordId -gt 0 -and
-        $highestRecordId -lt $AfterRecordId
-    )
-
-    if ($resetDetected) {
-        # The current Event ID 1 generation is entirely below the
-        # persisted checkpoint. Treat it as a cleared/recreated log
-        # instead of silently waiting for RecordId to exceed the old
-        # generation's checkpoint.
+    if ($generationResult.reset_detected) {
         $newEvents = @($availableEvents)
     }
     else {
+        $afterRecordId =
+            [long]$Checkpoint.last_record_id
+
         $newEvents = @(
             $availableEvents |
             Where-Object {
-                [long]$_.RecordId -gt $AfterRecordId
+                [long]$_.RecordId -gt $afterRecordId
             }
         )
     }
 
     return [PSCustomObject]@{
         events         = @($newEvents)
-        reset_detected = $resetDetected
+        reset_detected = [bool]$generationResult.reset_detected
+        reset_reason   = $generationResult.reason
     }
 }
 
@@ -345,11 +626,14 @@ try {
         )
     }
 
-    $lastRecordId = Read-Checkpoint
+    $checkpoint = Read-Checkpoint
 
     Write-Host "Sysmon push connector started."
     Write-Host "Log: $logName"
-    Write-Host "Checkpoint: $lastRecordId"
+    Write-Host (
+        "Checkpoint: " +
+        $checkpoint.last_record_id
+    )
 
     if ($Once) {
         Write-Host "Running one scan only."
@@ -363,20 +647,18 @@ try {
 
     do {
         $pollResult = Get-SysmonPollResult `
-            -AfterRecordId $lastRecordId
+            -Checkpoint $checkpoint
 
         if ($pollResult.reset_detected) {
             Write-Warning (
-                "Sysmon Event ID 1 RecordId moved below " +
-                "checkpoint $lastRecordId. " +
-                "Treating this as an event-log reset/recreation."
+                "Sysmon event-log generation changed. " +
+                "Resetting checkpoint. Reason: " +
+                $pollResult.reset_reason
             )
 
-            # Persist generation reset before sending. If a send fails,
-            # the next run starts from 0 and retries the current
-            # generation instead of restoring the stale old checkpoint.
             Save-Checkpoint -RecordId 0
-            $lastRecordId = [long]0
+
+            $checkpoint = Read-Checkpoint
         }
 
         $events = @($pollResult.events)
@@ -388,15 +670,30 @@ try {
             )
         }
         else {
-            Write-Host "No new Sysmon Event ID 1 records."
+            Write-Host (
+                "No new Sysmon Event ID 1 records."
+            )
         }
 
         foreach ($event in $events) {
-            $recordId = [long]$event.RecordId
+            $recordId =
+                [long]$event.RecordId
+
+            $recordFingerprint = $null
+            $eventTimeUtc = $null
 
             try {
-                $normalized = Convert-SysmonEventToM3 `
-                    -Event $event
+                $recordFingerprint =
+                    Get-EventFingerprint `
+                        -Event $event
+
+                $eventTimeUtc =
+                    Get-EventTimeUtc `
+                        -Event $event
+
+                $normalized =
+                    Convert-SysmonEventToM3 `
+                        -Event $event
 
                 $payload = $normalized |
                     ConvertTo-Json `
@@ -406,11 +703,12 @@ try {
                 Send-PayloadToLogstash `
                     -Payload $payload
 
-                # Advance checkpoint only after a successful send.
                 Save-Checkpoint `
-                    -RecordId $recordId
+                    -RecordId $recordId `
+                    -RecordSha256 $recordFingerprint `
+                    -EventTimeUtc $eventTimeUtc
 
-                $lastRecordId = $recordId
+                $checkpoint = Read-Checkpoint
 
                 Write-Host (
                     "Sent Sysmon Event ID " +
@@ -418,14 +716,9 @@ try {
                 )
             }
             catch {
-                $reason = $_.Exception.Message
+                $reason =
+                    $_.Exception.Message
 
-                # If conversion itself is bad, retain the rejected
-                # event and advance past it so one damaged record
-                # cannot block every later event.
-                #
-                # If Logstash sending failed, do NOT advance:
-                # the event will be retried on the next run.
                 if (
                     $reason -like
                     "Failed to send event to Logstash*"
@@ -438,9 +731,11 @@ try {
                     -Reason $reason
 
                 Save-Checkpoint `
-                    -RecordId $recordId
+                    -RecordId $recordId `
+                    -RecordSha256 $recordFingerprint `
+                    -EventTimeUtc $eventTimeUtc
 
-                $lastRecordId = $recordId
+                $checkpoint = Read-Checkpoint
 
                 Write-Warning (
                     "Rejected Sysmon record " +

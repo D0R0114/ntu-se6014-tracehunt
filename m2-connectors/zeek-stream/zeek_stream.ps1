@@ -392,7 +392,7 @@ function Set-FileCheckpoint {
 }
 
 
-function Get-ValidatedCheckpoint {
+function Get-FileCheckpointOffset {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path
@@ -409,58 +409,9 @@ function Get-ValidatedCheckpoint {
             -Path $fullPath `
             -Offset 0 `
             -PrefixSha256 $script:emptySha256
-
-        return [long]0
     }
 
-    $checkpoint = $script:checkpoints[$fullPath]
-    $offset = [long]$checkpoint.offset
-
-    $fileInfo = Get-Item `
-        -LiteralPath $fullPath `
-        -ErrorAction Stop
-
-    if ($offset -gt $fileInfo.Length) {
-
-        Write-Warning (
-            "$($fileInfo.Name) was truncated or replaced. " +
-            "Resetting its checkpoint."
-        )
-
-        Set-FileCheckpoint `
-            -Path $fullPath `
-            -Offset 0 `
-            -PrefixSha256 $script:emptySha256
-
-        return [long]0
-    }
-
-    if ($offset -gt 0) {
-
-        $currentPrefixHash = Get-PrefixSha256 `
-            -Path $fullPath `
-            -Length $offset
-
-        if (
-            $currentPrefixHash -ne
-            [string]$checkpoint.prefix_sha256
-        ) {
-            Write-Warning (
-                "$($fileInfo.Name) content before the " +
-                "saved checkpoint changed. " +
-                "Treating it as a replacement/rotation."
-            )
-
-            Set-FileCheckpoint `
-                -Path $fullPath `
-                -Offset 0 `
-                -PrefixSha256 $script:emptySha256
-
-            return [long]0
-        }
-    }
-
-    return $offset
+    return [long]$script:checkpoints[$fullPath].offset
 }
 
 
@@ -473,6 +424,7 @@ function Get-CompleteLinesFromOffset {
         [long]$Offset
     )
 
+    $fullPath = [IO.Path]::GetFullPath($Path)
     $fileStream = $null
 
     try {
@@ -481,11 +433,16 @@ function Get-CompleteLinesFromOffset {
             [IO.FileShare]::Delete
         )
 
-        # Open the file once and take one byte snapshot from this handle.
-        # If the pathname is atomically replaced while records are being
-        # sent, this handle still represents the generation we buffered.
+        # Open the pathname exactly once for this scan.
+        #
+        # Checkpoint validation and line extraction below both use bytes
+        # captured from THIS SAME file handle/generation. If the pathname
+        # is replaced before this open, the new generation is validated.
+        # If it is replaced after this open, this handle continues to
+        # represent the old generation and the replacement is detected
+        # on the next scan.
         $fileStream = New-Object System.IO.FileStream(
-            $Path,
+            $fullPath,
             [IO.FileMode]::Open,
             [IO.FileAccess]::Read,
             $share
@@ -493,17 +450,8 @@ function Get-CompleteLinesFromOffset {
 
         $snapshotLength = [long]$fileStream.Length
 
-        if ($Offset -gt $snapshotLength) {
-            throw "Saved offset is beyond the current file length."
-        }
-
         if ($snapshotLength -gt [int]::MaxValue) {
             throw "Zeek log is too large for one snapshot scan."
-        }
-
-        # Nothing new in this generation.
-        if ($Offset -eq $snapshotLength) {
-            return @()
         }
 
         $null = $fileStream.Seek(
@@ -517,7 +465,6 @@ function Get-CompleteLinesFromOffset {
         $totalRead = 0
 
         while ($totalRead -lt $snapshotBytes.Length) {
-
             $read = $fileStream.Read(
                 $snapshotBytes,
                 $totalRead,
@@ -532,7 +479,6 @@ function Get-CompleteLinesFromOffset {
         }
 
         if ($totalRead -lt $snapshotBytes.Length) {
-
             $trimmed = New-Object byte[] $totalRead
 
             if ($totalRead -gt 0) {
@@ -548,11 +494,72 @@ function Get-CompleteLinesFromOffset {
             $snapshotBytes = $trimmed
         }
 
-        if ($Offset -gt $snapshotBytes.Length) {
-            throw (
-                "File changed while taking the Zeek snapshot; " +
-                "saved offset is beyond the captured generation."
+        if (
+            -not $script:checkpoints.ContainsKey(
+                $fullPath
             )
+        ) {
+            Set-FileCheckpoint `
+                -Path $fullPath `
+                -Offset 0 `
+                -PrefixSha256 $script:emptySha256
+        }
+
+        $checkpoint =
+            $script:checkpoints[$fullPath]
+
+        $snapshotOffset =
+            [long]$checkpoint.offset
+
+        # IMPORTANT:
+        # Validate the checkpoint using the SAME captured byte generation
+        # that will supply the records. Do not reopen the pathname here.
+        if ($snapshotOffset -gt $snapshotBytes.Length) {
+            Write-Warning (
+                ([IO.Path]::GetFileName($fullPath)) +
+                " was truncated or replaced. " +
+                "Resetting its checkpoint."
+            )
+
+            Set-FileCheckpoint `
+                -Path $fullPath `
+                -Offset 0 `
+                -PrefixSha256 $script:emptySha256
+
+            $snapshotOffset = [long]0
+        }
+        elseif ($snapshotOffset -gt 0) {
+            $snapshotPrefixHash =
+                Get-BytesSha256 `
+                    -Bytes $snapshotBytes `
+                    -Length ([int]$snapshotOffset)
+
+            if (
+                $snapshotPrefixHash -ne
+                [string]$checkpoint.prefix_sha256
+            ) {
+                Write-Warning (
+                    ([IO.Path]::GetFileName($fullPath)) +
+                    " content before the saved checkpoint changed. " +
+                    "Treating it as a replacement/rotation."
+                )
+
+                Set-FileCheckpoint `
+                    -Path $fullPath `
+                    -Offset 0 `
+                    -PrefixSha256 $script:emptySha256
+
+                $snapshotOffset = [long]0
+            }
+        }
+
+        # Ignore a caller offset that may have been obtained before a
+        # pathname replacement. The validated snapshot offset above is
+        # authoritative.
+        $Offset = $snapshotOffset
+
+        if ($Offset -eq $snapshotBytes.Length) {
+            return @()
         }
 
         $lines = @()
@@ -563,14 +570,12 @@ function Get-CompleteLinesFromOffset {
             $i -lt $snapshotBytes.Length;
             $i++
         ) {
-            # Only newline-terminated records are complete.
             if ($snapshotBytes[$i] -ne 10) {
                 continue
             }
 
             $lineLength = $i - $lineStart
 
-            # Remove CR from CRLF without changing the saved byte offset.
             if (
                 $lineLength -gt 0 -and
                 $snapshotBytes[
@@ -583,7 +588,8 @@ function Get-CompleteLinesFromOffset {
                 $textLength = $lineLength
             }
 
-            $lineBytes = New-Object byte[] $textLength
+            $lineBytes =
+                New-Object byte[] $textLength
 
             if ($textLength -gt 0) {
                 [Array]::Copy(
@@ -597,11 +603,12 @@ function Get-CompleteLinesFromOffset {
 
             $endOffset = [long]($i + 1)
 
-            # Calculate the checkpoint hash from the SAME in-memory
-            # generation that supplied this line. Do not reopen Path.
-            $prefixHash = Get-BytesSha256 `
-                -Bytes $snapshotBytes `
-                -Length ($i + 1)
+            # Hash comes from the exact same snapshot generation as
+            # the record bytes represented by end_offset.
+            $prefixHash =
+                Get-BytesSha256 `
+                    -Bytes $snapshotBytes `
+                    -Length ($i + 1)
 
             $lines += [PSCustomObject]@{
                 bytes         = $lineBytes
@@ -613,20 +620,15 @@ function Get-CompleteLinesFromOffset {
             $lineStart = $i + 1
         }
 
-        # Any bytes after the last newline are deliberately NOT returned.
-        # Their checkpoint is therefore not advanced. Once Zeek finishes
-        # the line and writes a newline, it will be read on the next scan.
-
+        # Bytes after the final newline remain uncheckpointed.
         return $lines
     }
     finally {
-
         if ($null -ne $fileStream) {
             $fileStream.Dispose()
         }
     }
 }
-
 
 function Write-RejectedRecord {
     param(
@@ -810,7 +812,7 @@ try {
                 $file.FullName
             )
 
-            $offset = Get-ValidatedCheckpoint `
+            $offset = Get-FileCheckpointOffset `
                 -Path $fullPath
 
             $completeLines = @(
