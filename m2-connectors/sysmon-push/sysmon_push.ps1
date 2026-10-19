@@ -210,30 +210,110 @@ function Send-PayloadToLogstash {
 }
 
 
-function Get-NewSysmonEvents {
+function Test-IsNoMatchingEventsError {
+    param(
+        [Parameter(Mandatory = $true)]
+        $ErrorRecord
+    )
+
+    $fullyQualifiedErrorId = [string]$ErrorRecord.FullyQualifiedErrorId
+
+    if (
+        $fullyQualifiedErrorId -like
+        "NoMatchingEventsFound*"
+    ) {
+        return $true
+    }
+
+    $message = [string]$ErrorRecord.Exception.Message
+
+    if (
+        $message -match
+        "(?i)NoMatchingEventsFound|No events were found that match"
+    ) {
+        return $true
+    }
+
+    return $false
+}
+
+
+function Get-SysmonPollResult {
     param(
         [Parameter(Mandatory = $true)]
         [long]$AfterRecordId
     )
 
-    # Do not use -MaxEvents.
-    # Read every available Event ID 1 record newer than
-    # the persisted checkpoint so bursts are not lost.
-    $events = @(
-        Get-WinEvent `
-            -FilterHashtable @{
-                LogName = $logName
-                Id      = 1
-            } `
-            -ErrorAction Stop |
-        Where-Object {
-            [long]$_.RecordId -gt $AfterRecordId
-        } |
-        Sort-Object `
-            -Property RecordId
+    # Read the complete Event ID 1 snapshot first.
+    #
+    # We deliberately do not use -MaxEvents here. Besides avoiding burst
+    # loss, the snapshot lets us recognise the reviewer-reproduced reset
+    # case where the persisted checkpoint belongs to an older log
+    # generation (for example checkpoint 20, current records 1..3).
+    try {
+        $availableEvents = @(
+            Get-WinEvent `
+                -FilterHashtable @{
+                    LogName = $logName
+                    Id      = 1
+                } `
+                -ErrorAction Stop |
+            Sort-Object `
+                -Property RecordId
+        )
+    }
+    catch {
+        if (
+            Test-IsNoMatchingEventsError `
+                -ErrorRecord $_
+        ) {
+            # An empty Event ID 1 selection is a normal idle poll.
+            return [PSCustomObject]@{
+                events         = @()
+                reset_detected = $false
+            }
+        }
+
+        # Any other Get-WinEvent failure remains visible to the caller.
+        throw
+    }
+
+    if ($availableEvents.Count -eq 0) {
+        return [PSCustomObject]@{
+            events         = @()
+            reset_detected = $false
+        }
+    }
+
+    $highestRecordId = [long](
+        $availableEvents[-1].RecordId
     )
 
-    return $events
+    $resetDetected = (
+        $AfterRecordId -gt 0 -and
+        $highestRecordId -lt $AfterRecordId
+    )
+
+    if ($resetDetected) {
+        # The current Event ID 1 generation is entirely below the
+        # persisted checkpoint. Treat it as a cleared/recreated log
+        # instead of silently waiting for RecordId to exceed the old
+        # generation's checkpoint.
+        $newEvents = @($availableEvents)
+    }
+    else {
+        $newEvents = @(
+            $availableEvents |
+            Where-Object {
+                [long]$_.RecordId -gt $AfterRecordId
+            }
+        )
+    }
+
+    return [PSCustomObject]@{
+        events         = @($newEvents)
+        reset_detected = $resetDetected
+    }
 }
 
 
@@ -282,16 +362,33 @@ try {
     }
 
     do {
-        $events = @(
-            Get-NewSysmonEvents `
-                -AfterRecordId $lastRecordId
-        )
+        $pollResult = Get-SysmonPollResult `
+            -AfterRecordId $lastRecordId
+
+        if ($pollResult.reset_detected) {
+            Write-Warning (
+                "Sysmon Event ID 1 RecordId moved below " +
+                "checkpoint $lastRecordId. " +
+                "Treating this as an event-log reset/recreation."
+            )
+
+            # Persist generation reset before sending. If a send fails,
+            # the next run starts from 0 and retries the current
+            # generation instead of restoring the stale old checkpoint.
+            Save-Checkpoint -RecordId 0
+            $lastRecordId = [long]0
+        }
+
+        $events = @($pollResult.events)
 
         if ($events.Count -gt 0) {
             Write-Host (
                 "Found $($events.Count) new " +
                 "Sysmon Event ID 1 record(s)."
             )
+        }
+        else {
+            Write-Host "No new Sysmon Event ID 1 records."
         }
 
         foreach ($event in $events) {

@@ -29,6 +29,11 @@ $script:client = $null
 $script:networkStream = $null
 $script:writer = $null
 
+# SHA-256 of an empty byte sequence. Offset 0 is generation-neutral.
+$script:emptySha256 =
+    "e3b0c44298fc1c149afbf4c8996fb924" +
+    "27ae41e4649b934ca495991b7852b855"
+
 
 function Close-LogstashConnection {
 
@@ -235,6 +240,43 @@ function Get-PrefixSha256 {
 }
 
 
+function Get-BytesSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Length
+    )
+
+    if (
+        $Length -lt 0 -or
+        $Length -gt $Bytes.Length
+    ) {
+        throw "Invalid byte length for SHA-256."
+    }
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hash = $sha.ComputeHash(
+            $Bytes,
+            0,
+            $Length
+        )
+
+        return (
+            [BitConverter]::ToString(
+                $hash
+            ).Replace("-", "").ToLowerInvariant()
+        )
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+
 function Load-Checkpoints {
 
     $script:checkpoints = @{}
@@ -331,17 +373,19 @@ function Set-FileCheckpoint {
         [string]$Path,
 
         [Parameter(Mandatory = $true)]
-        [long]$Offset
+        [long]$Offset,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PrefixSha256
     )
 
-    $prefixHash = Get-PrefixSha256 `
-        -Path $Path `
-        -Length $Offset
-
+    # IMPORTANT: never reopen Path here to calculate the hash.
+    # PrefixSha256 must come from the same buffered file generation
+    # that supplied the bytes represented by Offset.
     $script:checkpoints[$Path] =
         [PSCustomObject]@{
             offset        = $Offset
-            prefix_sha256 = $prefixHash
+            prefix_sha256 = $PrefixSha256
         }
 
     Save-AllCheckpoints
@@ -363,7 +407,8 @@ function Get-ValidatedCheckpoint {
     ) {
         Set-FileCheckpoint `
             -Path $fullPath `
-            -Offset 0
+            -Offset 0 `
+            -PrefixSha256 $script:emptySha256
 
         return [long]0
     }
@@ -384,7 +429,8 @@ function Get-ValidatedCheckpoint {
 
         Set-FileCheckpoint `
             -Path $fullPath `
-            -Offset 0
+            -Offset 0 `
+            -PrefixSha256 $script:emptySha256
 
         return [long]0
     }
@@ -407,7 +453,8 @@ function Get-ValidatedCheckpoint {
 
             Set-FileCheckpoint `
                 -Path $fullPath `
-                -Offset 0
+                -Offset 0 `
+                -PrefixSha256 $script:emptySha256
 
             return [long]0
         }
@@ -434,6 +481,9 @@ function Get-CompleteLinesFromOffset {
             [IO.FileShare]::Delete
         )
 
+        # Open the file once and take one byte snapshot from this handle.
+        # If the pathname is atomically replaced while records are being
+        # sent, this handle still represents the generation we buffered.
         $fileStream = New-Object System.IO.FileStream(
             $Path,
             [IO.FileMode]::Open,
@@ -441,35 +491,37 @@ function Get-CompleteLinesFromOffset {
             $share
         )
 
-        if ($Offset -gt $fileStream.Length) {
+        $snapshotLength = [long]$fileStream.Length
+
+        if ($Offset -gt $snapshotLength) {
             throw "Saved offset is beyond the current file length."
         }
 
-        $null = $fileStream.Seek(
-            $Offset,
-            [IO.SeekOrigin]::Begin
-        )
+        if ($snapshotLength -gt [int]::MaxValue) {
+            throw "Zeek log is too large for one snapshot scan."
+        }
 
-        $remaining = $fileStream.Length - $Offset
-
-        if ($remaining -le 0) {
+        # Nothing new in this generation.
+        if ($Offset -eq $snapshotLength) {
             return @()
         }
 
-        if ($remaining -gt [int]::MaxValue) {
-            throw "Unread Zeek data is too large for one scan."
-        }
+        $null = $fileStream.Seek(
+            0,
+            [IO.SeekOrigin]::Begin
+        )
 
-        $buffer = New-Object byte[] ([int]$remaining)
+        $snapshotBytes =
+            New-Object byte[] ([int]$snapshotLength)
 
         $totalRead = 0
 
-        while ($totalRead -lt $buffer.Length) {
+        while ($totalRead -lt $snapshotBytes.Length) {
 
             $read = $fileStream.Read(
-                $buffer,
+                $snapshotBytes,
                 $totalRead,
-                $buffer.Length - $totalRead
+                $snapshotBytes.Length - $totalRead
             )
 
             if ($read -le 0) {
@@ -479,32 +531,40 @@ function Get-CompleteLinesFromOffset {
             $totalRead += $read
         }
 
-        if ($totalRead -lt $buffer.Length) {
+        if ($totalRead -lt $snapshotBytes.Length) {
 
             $trimmed = New-Object byte[] $totalRead
 
-            [Array]::Copy(
-                $buffer,
-                0,
-                $trimmed,
-                0,
-                $totalRead
-            )
+            if ($totalRead -gt 0) {
+                [Array]::Copy(
+                    $snapshotBytes,
+                    0,
+                    $trimmed,
+                    0,
+                    $totalRead
+                )
+            }
 
-            $buffer = $trimmed
+            $snapshotBytes = $trimmed
+        }
+
+        if ($Offset -gt $snapshotBytes.Length) {
+            throw (
+                "File changed while taking the Zeek snapshot; " +
+                "saved offset is beyond the captured generation."
+            )
         }
 
         $lines = @()
-
-        $lineStart = 0
+        $lineStart = [int]$Offset
 
         for (
-            $i = 0;
-            $i -lt $buffer.Length;
+            $i = [int]$Offset;
+            $i -lt $snapshotBytes.Length;
             $i++
         ) {
             # Only newline-terminated records are complete.
-            if ($buffer[$i] -ne 10) {
+            if ($snapshotBytes[$i] -ne 10) {
                 continue
             }
 
@@ -513,7 +573,7 @@ function Get-CompleteLinesFromOffset {
             # Remove CR from CRLF without changing the saved byte offset.
             if (
                 $lineLength -gt 0 -and
-                $buffer[
+                $snapshotBytes[
                     $lineStart + $lineLength - 1
                 ] -eq 13
             ) {
@@ -527,7 +587,7 @@ function Get-CompleteLinesFromOffset {
 
             if ($textLength -gt 0) {
                 [Array]::Copy(
-                    $buffer,
+                    $snapshotBytes,
                     $lineStart,
                     $lineBytes,
                     0,
@@ -535,19 +595,19 @@ function Get-CompleteLinesFromOffset {
                 )
             }
 
-            $endOffset = (
-                $Offset +
-                $i +
-                1
-            )
+            $endOffset = [long]($i + 1)
+
+            # Calculate the checkpoint hash from the SAME in-memory
+            # generation that supplied this line. Do not reopen Path.
+            $prefixHash = Get-BytesSha256 `
+                -Bytes $snapshotBytes `
+                -Length ($i + 1)
 
             $lines += [PSCustomObject]@{
-                bytes      = $lineBytes
-                start      = (
-                    $Offset +
-                    $lineStart
-                )
-                end_offset = $endOffset
+                bytes         = $lineBytes
+                start         = [long]$lineStart
+                end_offset    = $endOffset
+                prefix_sha256 = $prefixHash
             }
 
             $lineStart = $i + 1
@@ -787,7 +847,8 @@ try {
 
                     Set-FileCheckpoint `
                         -Path $fullPath `
-                        -Offset $line.end_offset
+                        -Offset $line.end_offset `
+                        -PrefixSha256 $line.prefix_sha256
 
                     Write-Warning (
                         "Rejected invalid UTF-8 record " +
@@ -805,7 +866,8 @@ try {
                 ) {
                     Set-FileCheckpoint `
                         -Path $fullPath `
-                        -Offset $line.end_offset
+                        -Offset $line.end_offset `
+                        -PrefixSha256 $line.prefix_sha256
 
                     continue
                 }
@@ -827,7 +889,8 @@ try {
 
                     Set-FileCheckpoint `
                         -Path $fullPath `
-                        -Offset $line.end_offset
+                        -Offset $line.end_offset `
+                        -PrefixSha256 $line.prefix_sha256
 
                     Write-Warning (
                         "Rejected malformed JSON from " +
@@ -872,7 +935,8 @@ try {
 
                     Set-FileCheckpoint `
                         -Path $fullPath `
-                        -Offset $line.end_offset
+                        -Offset $line.end_offset `
+                        -PrefixSha256 $line.prefix_sha256
 
                     Write-Warning (
                         "Rejected Zeek record from " +
@@ -891,7 +955,8 @@ try {
 
                 Set-FileCheckpoint `
                     -Path $fullPath `
-                    -Offset $line.end_offset
+                    -Offset $line.end_offset `
+                    -PrefixSha256 $line.prefix_sha256
 
                 Write-Host (
                     "Sent Zeek event from " +

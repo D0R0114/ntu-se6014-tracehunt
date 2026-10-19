@@ -43,6 +43,8 @@ Features:
 - Retry handling
 - Rejected-record retention
 - Prevents replay after restart
+- Detects an event-log reset when the current RecordIds fall behind the persisted checkpoint
+- Treats `NoMatchingEventsFound` as an idle poll while preserving genuine read errors
 
 One-scan test:
 
@@ -63,6 +65,7 @@ Features:
 - Persistent byte-offset checkpoints
 - Incomplete-line protection
 - File replacement/rotation detection using prefix SHA-256
+- Checkpoint hashes tied to the file generation that supplied the buffered bytes
 - Malformed-record rejection without stopping later records
 - Retry handling
 - Raw-line preservation
@@ -110,6 +113,42 @@ Expected result:
 Passed: 7
 Failed: 0
 ```
+
+The suite includes executable connector regression tests for the reviewer-reproduced edge cases.
+
+### Sysmon reset and idle poll
+
+The test starts with a persisted checkpoint of RecordId 20 and simulates a recreated event log containing RecordIds 1, 2, and 3.
+
+Expected result:
+
+- RecordIds 1, 2, and 3 are sent.
+- The checkpoint advances to 3.
+- `NoMatchingEventsFound` is treated as an idle poll and exits with code 0.
+- A genuine `Get-WinEvent` failure exits with code 1.
+
+### Zeek rotation during send
+
+The test starts with 100 OLD records and atomically replaces the Zeek log with 100 NEW records of the same byte length while the OLD batch is being sent.
+
+Expected result:
+
+- First run sends 100 OLD records.
+- After restart, 100 NEW records are sent.
+- Both connector runs exit with code 0.
+- The replacement generation is not skipped.
+
+### Windows sample execution
+
+The supplied `samples/windows/windows_security_sample.ndjson` contains 20 usable records with host and decoded event fields.
+
+Expected result:
+
+- Input records: 20
+- Sent events: 20
+- Exit code: 0
+- `host.name`: `TRACEHUNT-SAMPLE-PC`
+- `TargetUserName`: `sampleuser`
 
 GitHub Actions runs the M2 regression tests on Windows and Ubuntu.
 

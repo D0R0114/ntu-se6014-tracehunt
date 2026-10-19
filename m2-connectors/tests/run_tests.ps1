@@ -191,54 +191,55 @@ Run-Test "Zeek adapter contract" {
     Assert-Equal $record.raw_line $raw "raw_line"
 }
 
-Run-Test "Sysmon checkpoint regression guards" {
+function Invoke-ExecutionTest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TestFile
+    )
 
-    $text = Get-Content `
-        (Join-Path $m2Root "sysmon-push\sysmon_push.ps1") `
-        -Raw
+    $testPath = Join-Path $PSScriptRoot $TestFile
 
-    Assert-True ($text -match "last_record_id") `
-        "persistent checkpoint missing"
+    if (-not (Test-Path $testPath)) {
+        throw "Execution test not found: $testPath"
+    }
 
-    Assert-True ($text -match "Save-Checkpoint") `
-        "checkpoint save missing"
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
 
-    Assert-True (-not ($text -match "-MaxEvents\s+10")) `
-        "old latest-10 behavior detected"
+    if ($null -ne $pwsh) {
+        & $pwsh.Source `
+            -NoProfile `
+            -File $testPath
+    }
+    else {
+        $windowsPowerShell = Get-Command `
+            powershell.exe `
+            -ErrorAction Stop
+
+        & $windowsPowerShell.Source `
+            -NoProfile `
+            -ExecutionPolicy Bypass `
+            -File $testPath
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "$TestFile exited with code $LASTEXITCODE"
+    }
 }
 
-Run-Test "Zeek reliability regression guards" {
-
-    $text = Get-Content `
-        (Join-Path $m2Root "zeek-stream\zeek_stream.ps1") `
-        -Raw
-
-    Assert-True ($text -match "prefix_sha256") `
-        "replacement detection hash missing"
-
-    Assert-True ($text -match "zeek_rejected") `
-        "rejected-record handling missing"
-
-    Assert-True ($text -match "byte_offset") `
-        "byte checkpoint handling missing"
+Run-Test "Sysmon reset and idle-poll execution" {
+    Invoke-ExecutionTest `
+        -TestFile "sysmon_reset_execution.ps1"
 }
 
-Run-Test "Windows EVTX and NDJSON regression guards" {
-
-    $text = Get-Content `
-        (Join-Path $m2Root "windows-pull\windows_pull.ps1") `
-        -Raw
-
-    Assert-True ($text -match "\.evtx") `
-        "EVTX support missing"
-
-    Assert-True ($text -match "\.ndjson") `
-        "NDJSON support missing"
-
-    Assert-True ($text -match "exit\s+1") `
-        "non-zero failure exit missing"
+Run-Test "Zeek rotation-during-send execution" {
+    Invoke-ExecutionTest `
+        -TestFile "zeek_rotation_during_send.ps1"
 }
 
+Run-Test "Windows sample execution" {
+    Invoke-ExecutionTest `
+        -TestFile "windows_sample_execution.ps1"
+}
 Write-Host ""
 Write-Host "Passed: $script:passed"
 Write-Host "Failed: $script:failed"
