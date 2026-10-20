@@ -9,6 +9,14 @@ function Assert-Equal {
     }
 }
 
+function Assert-True {
+    param([bool]$Condition, [string]$Message)
+
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
 function Assert-Sequence {
     param(
         [object[]]$Actual,
@@ -16,22 +24,18 @@ function Assert-Sequence {
         [string]$Message
     )
 
-    $actualText = (@($Actual) | ForEach-Object { [string]$_ }) -join ","
-    $expectedText = (@($Expected) | ForEach-Object { [string]$_ }) -join ","
+    $actualText = (
+        @($Actual) |
+        ForEach-Object { [string]$_ }
+    ) -join ","
+
+    $expectedText = (
+        @($Expected) |
+        ForEach-Object { [string]$_ }
+    ) -join ","
 
     if ($actualText -ne $expectedText) {
         throw "$Message | expected=[$expectedText] actual=[$actualText]"
-    }
-}
-
-function Assert-True {
-    param(
-        [bool]$Condition,
-        [string]$Message
-    )
-
-    if (-not $Condition) {
-        throw $Message
     }
 }
 
@@ -41,19 +45,16 @@ function Get-Sha256Hex {
         [string]$Text
     )
 
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
-        $Text
-    )
-
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
     $sha = [Security.Cryptography.SHA256]::Create()
 
     try {
         $hash = $sha.ComputeHash($bytes)
 
         return (
-            [BitConverter]::ToString(
-                $hash
-            ).Replace("-", "").ToLowerInvariant()
+            [BitConverter]::ToString($hash).
+            Replace("-", "").
+            ToLowerInvariant()
         )
     }
     finally {
@@ -61,12 +62,45 @@ function Get-Sha256Hex {
     }
 }
 
+function Write-CheckpointFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        $Value
+    )
+
+    $json = $Value | ConvertTo-Json -Depth 10 -Compress
+
+    [IO.File]::WriteAllText(
+        $Path,
+        $json,
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
+function Read-CheckpointFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return (
+        [IO.File]::ReadAllText(
+            $Path,
+            [Text.Encoding]::UTF8
+        ) | ConvertFrom-Json
+    )
+}
+
 function Start-TcpRecorder {
     param(
         [Parameter(Mandatory = $true)]
         [int]$Port,
 
-        [int]$ExpectedLines = 3
+        [Parameter(Mandatory = $true)]
+        [int]$ExpectedLines
     )
 
     return Start-Job -ArgumentList @(
@@ -74,8 +108,8 @@ function Start-TcpRecorder {
         $ExpectedLines
     ) -ScriptBlock {
         param(
-            $Port,
-            $ExpectedLines
+            [int]$Port,
+            [int]$ExpectedLines
         )
 
         $ErrorActionPreference = "Stop"
@@ -90,7 +124,7 @@ function Start-TcpRecorder {
             $listener.Start()
 
             $lines = New-Object System.Collections.Generic.List[string]
-            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
 
             while (
                 $lines.Count -lt $ExpectedLines -and
@@ -128,7 +162,7 @@ function Start-TcpRecorder {
             }
 
             return [PSCustomObject]@{
-                lines     = @($lines)
+                lines     = @($lines.ToArray())
                 timed_out = ($lines.Count -lt $ExpectedLines)
             }
         }
@@ -146,29 +180,18 @@ function Receive-RecorderResult {
         $Job
     )
 
-    $null = Wait-Job `
-        -Job $Job `
-        -Timeout 25
+    $null = Wait-Job -Job $Job -Timeout 35
 
     if ($Job.State -eq "Running") {
-        Stop-Job `
-            -Job $Job `
-            -ErrorAction SilentlyContinue
-
-        Remove-Job `
-            -Job $Job `
-            -Force `
-            -ErrorAction SilentlyContinue
+        Stop-Job -Job $Job -ErrorAction SilentlyContinue
+        Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
 
         throw "TCP recorder timed out."
     }
 
     $result = Receive-Job -Job $Job
 
-    Remove-Job `
-        -Job $Job `
-        -Force `
-        -ErrorAction SilentlyContinue
+    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
 
     if ($null -eq $result) {
         throw "TCP recorder returned no result."
@@ -192,6 +215,7 @@ param(
     [ValidateSet(
         "reset",
         "reset25",
+        "legacyMissingAnchor",
         "empty",
         "failure"
     )]
@@ -248,18 +272,14 @@ function New-FakeSysmonEvent {
     $event | Add-Member `
         -MemberType ScriptMethod `
         -Name ToXml `
-        -Value {
-            return $this.Xml
-        }
+        -Value { return $this.Xml }
 
     return $event
 }
 
 function Get-WinEvent {
     [CmdletBinding()]
-    param(
-        $FilterHashtable
-    )
+    param($FilterHashtable)
 
     switch ($Mode) {
         "reset" {
@@ -271,13 +291,21 @@ function Get-WinEvent {
         }
 
         "reset25" {
-            return @(
-                for ($i = 1; $i -le 25; $i++) {
-                    New-FakeSysmonEvent `
-                        -RecordId $i `
-                        -Generation "NEW"
-                }
-            )
+            return @(foreach ($id in (1..25)) {
+                New-FakeSysmonEvent `
+                    -RecordId $id `
+                    -Generation "NEW"
+            })
+        }
+
+        "legacyMissingAnchor" {
+            $ids = @((1..19) + (21..25))
+
+            return @(foreach ($id in $ids) {
+                New-FakeSysmonEvent `
+                    -RecordId $id `
+                    -Generation "NEW"
+            })
         }
 
         "empty" {
@@ -340,22 +368,41 @@ function Invoke-Harness {
         [string]$StderrPath
     )
 
+    $argumentLine = (
+        '-NoProfile -ExecutionPolicy Bypass -File "{0}" ' +
+        '-ConnectorPath "{1}" -Mode "{2}" -Port {3}'
+    ) -f $HarnessPath, $ConnectorPath, $Mode, $Port
+
     $process = Start-Process `
         -FilePath $ShellPath `
-        -ArgumentList @(
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", $HarnessPath,
-            "-ConnectorPath", $ConnectorPath,
-            "-Mode", $Mode,
-            "-Port", [string]$Port
-        ) `
+        -ArgumentList $argumentLine `
         -Wait `
         -PassThru `
         -RedirectStandardOutput $StdoutPath `
         -RedirectStandardError $StderrPath
 
-    return [int]$process.ExitCode
+    $stdout = ""
+    $stderr = ""
+
+    if (Test-Path $StdoutPath) {
+        $stdout = [IO.File]::ReadAllText(
+            $StdoutPath,
+            [Text.Encoding]::UTF8
+        )
+    }
+
+    if (Test-Path $StderrPath) {
+        $stderr = [IO.File]::ReadAllText(
+            $StderrPath,
+            [Text.Encoding]::UTF8
+        )
+    }
+
+    return [PSCustomObject]@{
+        ExitCode = [int]$process.ExitCode
+        Stdout   = $stdout
+        Stderr   = $stderr
+    }
 }
 
 function New-OldGenerationEvent20Xml {
@@ -389,25 +436,20 @@ $m2Root = (
     )
 ).Path
 
-$pwsh = Get-Command `
-    pwsh `
-    -ErrorAction SilentlyContinue
+$pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
 
 if ($null -ne $pwsh) {
     $shellPath = $pwsh.Source
 }
 else {
     $shellPath = (
-        Get-Command `
-            powershell.exe `
-            -ErrorAction Stop
+        Get-Command powershell.exe -ErrorAction Stop
     ).Source
 }
 
 $tempRoot = Join-Path `
     ([IO.Path]::GetTempPath()) `
-    ("tracehunt-sysmon-reset-" +
-        [Guid]::NewGuid().ToString("N"))
+    ("tracehunt-sysmon-reset-" + [Guid]::NewGuid().ToString("N"))
 
 try {
     New-Item `
@@ -416,34 +458,18 @@ try {
         -Path $tempRoot |
         Out-Null
 
-    $testM2Root = Join-Path `
-        $tempRoot `
-        "m2-connectors"
+    $testM2Root = Join-Path $tempRoot "m2-connectors"
 
     Copy-Item `
         -Path $m2Root `
         -Destination $testM2Root `
         -Recurse
 
-    $sysmonRoot = Join-Path `
-        $testM2Root `
-        "sysmon-push"
-
-    $stateFolder = Join-Path `
-        $sysmonRoot `
-        "state"
-
-    $checkpointPath = Join-Path `
-        $stateFolder `
-        "checkpoint.json"
-
-    $connectorPath = Join-Path `
-        $sysmonRoot `
-        "sysmon_push.ps1"
-
-    $harnessPath = Join-Path `
-        $tempRoot `
-        "sysmon_mock_harness.ps1"
+    $sysmonRoot = Join-Path $testM2Root "sysmon-push"
+    $stateFolder = Join-Path $sysmonRoot "state"
+    $checkpointPath = Join-Path $stateFolder "checkpoint.json"
+    $connectorPath = Join-Path $sysmonRoot "sysmon_push.ps1"
+    $harnessPath = Join-Path $tempRoot "sysmon_mock_harness.ps1"
 
     New-Item `
         -ItemType Directory `
@@ -451,313 +477,243 @@ try {
         -Path $stateFolder |
         Out-Null
 
-    Write-MockHarness `
-        -Path $harnessPath
+    Write-MockHarness -Path $harnessPath
 
-    # ================================================================
-    # Case 1
-    # Legacy checkpoint 20, recreated log contains only IDs 1,2,3.
-    # ================================================================
-    $checkpoint20 = [ordered]@{
-        last_record_id = 20
-        updated_at     = "2026-10-19T07:00:00.0000000Z"
-    } |
-        ConvertTo-Json `
-            -Compress
+    # Case 1: checkpoint ahead of recreated log.
 
-    [IO.File]::WriteAllText(
-        $checkpointPath,
-        $checkpoint20,
-        [Text.UTF8Encoding]::new($false)
-    )
+    Write-CheckpointFile `
+        -Path $checkpointPath `
+        -Value ([ordered]@{
+            last_record_id = 20
+            updated_at = "2026-10-19T07:00:00.0000000Z"
+        })
 
-    $port = Get-Random `
-        -Minimum 25000 `
-        -Maximum 45000
+    $port = Get-Random -Minimum 25000 -Maximum 45000
 
     $receiver = Start-TcpRecorder `
         -Port $port `
         -ExpectedLines 3
 
-    Start-Sleep `
-        -Milliseconds 700
+    Start-Sleep -Milliseconds 500
 
-    $resetOut = Join-Path `
-        $tempRoot `
-        "reset.stdout.txt"
-
-    $resetErr = Join-Path `
-        $tempRoot `
-        "reset.stderr.txt"
-
-    $resetExit = Invoke-Harness `
+    $result = Invoke-Harness `
         -ShellPath $shellPath `
         -HarnessPath $harnessPath `
         -ConnectorPath $connectorPath `
         -Mode "reset" `
         -Port $port `
-        -StdoutPath $resetOut `
-        -StderrPath $resetErr
+        -StdoutPath (Join-Path $tempRoot "reset.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "reset.stderr.txt")
 
-    $capture = Receive-RecorderResult `
-        -Job $receiver
+    $capture = Receive-RecorderResult -Job $receiver
 
-    Assert-Equal `
-        $resetExit `
-        0 `
-        "Reset case exit code"
+    Assert-Equal $result.ExitCode 0 "Simple reset exit code"
+    Assert-True (-not $capture.timed_out) "Simple reset TCP recorder timed out"
+    Assert-Equal @($capture.lines).Count 3 "Simple reset sent count"
 
-    Assert-Equal `
-        @($capture.lines).Count `
-        3 `
-        "Reset case sent count"
-
-    Assert-True `
-        (-not $capture.timed_out) `
-        "Reset case TCP recorder timed out."
-
-    $recordIds = @(
-        foreach ($line in @($capture.lines)) {
-            $payload = $line |
-                ConvertFrom-Json
-
-            [long]$payload.winlog.record_id
-        }
-    )
+    $resetIds = @(foreach ($line in $capture.lines) {
+        $payload = $line | ConvertFrom-Json
+        [long]$payload.winlog.record_id
+    })
 
     Assert-Sequence `
-        -Actual $recordIds `
+        -Actual $resetIds `
         -Expected @(1, 2, 3) `
-        -Message "Reset case sent RecordIds"
+        -Message "Simple reset RecordIds"
 
-    $checkpointAfterReset = (
-        [IO.File]::ReadAllText(
-            $checkpointPath,
-            [Text.Encoding]::UTF8
-        ) |
-            ConvertFrom-Json
-    )
+    $checkpoint = Read-CheckpointFile -Path $checkpointPath
 
-    Assert-Equal `
-        $checkpointAfterReset.last_record_id `
-        3 `
-        "Checkpoint after event-log reset"
+    Assert-Equal $checkpoint.last_record_id 3 "Simple reset checkpoint"
 
-    Assert-True `
-        (
-            -not [string]::IsNullOrWhiteSpace(
-                [string]$checkpointAfterReset.last_record_sha256
-            )
-        ) `
-        "Checkpoint fingerprint missing after reset"
+    Assert-True (
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$checkpoint.last_record_sha256
+        )
+    ) "Simple reset checkpoint fingerprint missing"
 
-    # ================================================================
-    # Case 2
-    # Strong generation test:
-    #
-    # Persisted checkpoint belongs to OLD generation at RecordId 20.
-    # NEW generation already contains RecordIds 1..25.
-    #
-    # A RecordId-only implementation would incorrectly send 21..25.
-    # Fingerprint generation detection must replay ALL 1..25.
-    # ================================================================
-    $oldEvent20Xml =
-        New-OldGenerationEvent20Xml
+    # Case 2: fingerprint-bearing generation detection.
 
-    $oldEvent20Hash =
-        Get-Sha256Hex `
-            -Text $oldEvent20Xml
+    $oldEvent20Hash = Get-Sha256Hex `
+        -Text (New-OldGenerationEvent20Xml)
 
-    $checkpointOldGeneration = [ordered]@{
-        last_record_id      = 20
-        last_record_sha256  = $oldEvent20Hash
-        last_event_time_utc = "2026-10-19T07:00:00.0000000Z"
-        updated_at          = "2026-10-19T07:00:01.0000000Z"
-    } |
-        ConvertTo-Json `
-            -Compress
+    Write-CheckpointFile `
+        -Path $checkpointPath `
+        -Value ([ordered]@{
+            last_record_id = 20
+            last_record_sha256 = $oldEvent20Hash
+            last_event_time_utc = "2026-10-19T07:00:00.0000000Z"
+            updated_at = "2026-10-19T07:00:01.0000000Z"
+        })
 
-    [IO.File]::WriteAllText(
-        $checkpointPath,
-        $checkpointOldGeneration,
-        [Text.UTF8Encoding]::new($false)
-    )
-
-    $port25 = Get-Random `
-        -Minimum 25000 `
-        -Maximum 45000
+    $port25 = Get-Random -Minimum 25000 -Maximum 45000
 
     $receiver25 = Start-TcpRecorder `
         -Port $port25 `
         -ExpectedLines 25
 
-    Start-Sleep `
-        -Milliseconds 700
+    Start-Sleep -Milliseconds 500
 
-    $reset25Out = Join-Path `
-        $tempRoot `
-        "reset25.stdout.txt"
-
-    $reset25Err = Join-Path `
-        $tempRoot `
-        "reset25.stderr.txt"
-
-    $reset25Exit = Invoke-Harness `
+    $result25 = Invoke-Harness `
         -ShellPath $shellPath `
         -HarnessPath $harnessPath `
         -ConnectorPath $connectorPath `
         -Mode "reset25" `
         -Port $port25 `
-        -StdoutPath $reset25Out `
-        -StderrPath $reset25Err
+        -StdoutPath (Join-Path $tempRoot "reset25.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "reset25.stderr.txt")
 
-    $capture25 = Receive-RecorderResult `
-        -Job $receiver25
+    $capture25 = Receive-RecorderResult -Job $receiver25
 
-    Assert-Equal `
-        $reset25Exit `
-        0 `
-        "Generation-reset 1..25 exit code"
+    Assert-Equal $result25.ExitCode 0 "Fingerprint generation exit code"
+    Assert-True (-not $capture25.timed_out) "Fingerprint generation recorder timed out"
+    Assert-Equal @($capture25.lines).Count 25 "Fingerprint generation sent count"
 
-    Assert-True `
-        (-not $capture25.timed_out) `
-        "Generation-reset 1..25 TCP recorder timed out."
-
-    Assert-Equal `
-        @($capture25.lines).Count `
-        25 `
-        "Generation-reset 1..25 sent count"
-
-    $recordIds25 = @(
-        foreach ($line in @($capture25.lines)) {
-            $payload = $line |
-                ConvertFrom-Json
-
-            [long]$payload.winlog.record_id
-        }
-    )
-
-    $expectedIds25 = @(
-        1..25
-    )
+    $ids25 = @(foreach ($line in $capture25.lines) {
+        $payload = $line | ConvertFrom-Json
+        [long]$payload.winlog.record_id
+    })
 
     Assert-Sequence `
-        -Actual $recordIds25 `
-        -Expected $expectedIds25 `
-        -Message "Generation-reset 1..25 sent RecordIds"
+        -Actual $ids25 `
+        -Expected @(1..25) `
+        -Message "Fingerprint generation RecordIds"
 
-    $checkpointAfter25 = (
-        [IO.File]::ReadAllText(
-            $checkpointPath,
-            [Text.Encoding]::UTF8
-        ) |
-            ConvertFrom-Json
-    )
+    $checkpoint25 = Read-CheckpointFile -Path $checkpointPath
+
+    Assert-Equal $checkpoint25.last_record_id 25 "Fingerprint generation checkpoint"
+
+    Assert-True (
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$checkpoint25.last_record_sha256
+        )
+    ) "Fingerprint generation checkpoint hash missing"
+
+    Assert-True (
+        [string]$checkpoint25.last_record_sha256 -ne $oldEvent20Hash
+    ) "Fingerprint generation checkpoint still contains old hash"
+
+    # Case 3: legacy checkpoint without fingerprint; RecordId 20 absent.
+
+    Write-CheckpointFile `
+        -Path $checkpointPath `
+        -Value ([ordered]@{
+            last_record_id = 20
+            updated_at = "2026-10-19T07:00:00.0000000Z"
+        })
+
+    $port24 = Get-Random -Minimum 25000 -Maximum 45000
+
+    $receiver24 = Start-TcpRecorder `
+        -Port $port24 `
+        -ExpectedLines 24
+
+    Start-Sleep -Milliseconds 500
+
+    $legacyResult = Invoke-Harness `
+        -ShellPath $shellPath `
+        -HarnessPath $harnessPath `
+        -ConnectorPath $connectorPath `
+        -Mode "legacyMissingAnchor" `
+        -Port $port24 `
+        -StdoutPath (Join-Path $tempRoot "legacy.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "legacy.stderr.txt")
+
+    $legacyCapture = Receive-RecorderResult -Job $receiver24
+
+    Assert-Equal $legacyResult.ExitCode 0 "Legacy missing-anchor exit code"
+    Assert-True (-not $legacyCapture.timed_out) "Legacy missing-anchor recorder timed out"
+    Assert-Equal @($legacyCapture.lines).Count 24 "Legacy missing-anchor sent count"
+
+    $expectedLegacyIds = @((1..19) + (21..25))
+
+    $legacyIds = @(foreach ($line in $legacyCapture.lines) {
+        $payload = $line | ConvertFrom-Json
+        [long]$payload.winlog.record_id
+    })
+
+    Assert-Sequence `
+        -Actual $legacyIds `
+        -Expected $expectedLegacyIds `
+        -Message "Legacy missing-anchor RecordIds"
+
+    $checkpointAfterLegacy = Read-CheckpointFile -Path $checkpointPath
+
+    Assert-Equal $checkpointAfterLegacy.last_record_id 25 "Legacy checkpoint after migration"
+
+    Assert-True (
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$checkpointAfterLegacy.last_record_sha256
+        )
+    ) "Legacy checkpoint fingerprint missing after migration"
+
+    # Case 4: second run must not replay the 24 sent records.
+    # Port 1 has no listener; accidental replay should fail.
+
+    $secondRun = Invoke-Harness `
+        -ShellPath $shellPath `
+        -HarnessPath $harnessPath `
+        -ConnectorPath $connectorPath `
+        -Mode "legacyMissingAnchor" `
+        -Port 1 `
+        -StdoutPath (Join-Path $tempRoot "legacy-second.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "legacy-second.stderr.txt")
+
+    Assert-Equal $secondRun.ExitCode 0 "Legacy second run exit code"
+
+    Assert-True (
+        $secondRun.Stdout -notmatch "Sent Sysmon Event ID"
+    ) "Legacy second run replayed records"
+
+    $checkpointAfterSecondRun = Read-CheckpointFile -Path $checkpointPath
+
+    Assert-Equal $checkpointAfterSecondRun.last_record_id 25 "Checkpoint after second run"
 
     Assert-Equal `
-        $checkpointAfter25.last_record_id `
-        25 `
-        "Checkpoint after generation-reset 1..25"
+        $checkpointAfterSecondRun.last_record_sha256 `
+        $checkpointAfterLegacy.last_record_sha256 `
+        "Checkpoint hash must remain unchanged on second run"
 
-    Assert-True `
-        (
-            -not [string]::IsNullOrWhiteSpace(
-                [string]$checkpointAfter25.last_record_sha256
-            )
-        ) `
-        "Generation-reset checkpoint fingerprint missing"
+    # Case 5: no matching events is a normal idle poll.
 
-    Assert-True `
-        (
-            [string]$checkpointAfter25.last_record_sha256 -ne
-            $oldEvent20Hash
-        ) `
-        "Generation-reset checkpoint still contains OLD fingerprint"
-
-    # ================================================================
-    # Case 3
-    # NoMatchingEventsFound is a normal idle poll.
-    # ================================================================
-    $emptyOut = Join-Path `
-        $tempRoot `
-        "empty.stdout.txt"
-
-    $emptyErr = Join-Path `
-        $tempRoot `
-        "empty.stderr.txt"
-
-    $emptyExit = Invoke-Harness `
+    $emptyResult = Invoke-Harness `
         -ShellPath $shellPath `
         -HarnessPath $harnessPath `
         -ConnectorPath $connectorPath `
         -Mode "empty" `
         -Port 1 `
-        -StdoutPath $emptyOut `
-        -StderrPath $emptyErr
+        -StdoutPath (Join-Path $tempRoot "empty.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "empty.stderr.txt")
 
-    Assert-Equal `
-        $emptyExit `
-        0 `
-        "NoMatchingEventsFound exit code"
+    Assert-Equal $emptyResult.ExitCode 0 "NoMatchingEventsFound exit code"
 
-    $checkpointAfterEmpty = (
-        [IO.File]::ReadAllText(
-            $checkpointPath,
-            [Text.Encoding]::UTF8
-        ) |
-            ConvertFrom-Json
-    )
+    $checkpointAfterEmpty = Read-CheckpointFile -Path $checkpointPath
 
-    Assert-Equal `
-        $checkpointAfterEmpty.last_record_id `
-        25 `
-        "Idle poll must preserve checkpoint"
+    Assert-Equal $checkpointAfterEmpty.last_record_id 25 "Idle poll must preserve checkpoint"
 
-    # ================================================================
-    # Case 4
-    # Genuine Get-WinEvent failure remains visible.
-    # ================================================================
-    $failureOut = Join-Path `
-        $tempRoot `
-        "failure.stdout.txt"
+    # Case 6: a genuine Get-WinEvent failure must remain visible.
 
-    $failureErr = Join-Path `
-        $tempRoot `
-        "failure.stderr.txt"
-
-    $failureExit = Invoke-Harness `
+    $failureResult = Invoke-Harness `
         -ShellPath $shellPath `
         -HarnessPath $harnessPath `
         -ConnectorPath $connectorPath `
         -Mode "failure" `
         -Port 1 `
-        -StdoutPath $failureOut `
-        -StderrPath $failureErr
+        -StdoutPath (Join-Path $tempRoot "failure.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "failure.stderr.txt")
 
-    Assert-Equal `
-        $failureExit `
-        1 `
-        "Real read failure exit code"
+    Assert-Equal $failureResult.ExitCode 1 "Genuine read failure exit code"
 
-    Write-Host (
-        "[PASS] Sysmon reset, generation, " +
-        "and empty-poll execution tests"
-    )
-
+    Write-Host "[PASS] Sysmon reset, fingerprint generation, legacy missing-anchor migration,"
+    Write-Host "       second-run no-replay, idle poll, and genuine read-failure tests."
     Write-Host "Simple reset sent RecordIds: 1,2,3"
-    Write-Host "Generation reset sent RecordIds: 1..25"
-    Write-Host "Checkpoint after generation reset: 25"
-    Write-Host "NoMatchingEventsFound exit: 0"
-    Write-Host "Real read failure exit: 1"
+    Write-Host "Fingerprint generation sent RecordIds: 1..25"
+    Write-Host "Legacy migration sent RecordIds: 1..19,21..25 (24 records)"
+    Write-Host "Second run replayed no records."
 
     exit 0
 }
 catch {
-    Write-Host (
-        "[FAIL] Sysmon reset/generation execution tests - " +
-        $_.Exception.Message
-    )
-
+    Write-Host "[FAIL] Sysmon checkpoint execution tests - $($_.Exception.Message)"
     exit 1
 }
 finally {

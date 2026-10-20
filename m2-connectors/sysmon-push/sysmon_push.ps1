@@ -1,3 +1,4 @@
+
 param(
     [switch]$Once,
     [switch]$ResetCheckpoint,
@@ -487,6 +488,61 @@ function Test-CheckpointGeneration {
     # written, it must belong to a recreated/newer log generation.
     $savedUpdatedAt =
         [string]$Checkpoint.updated_at
+
+    # Legacy checkpoints have no event fingerprint. If the anchor is absent
+    # while records on both sides remain, use event timestamps to distinguish
+    # a recreated generation from normal oldest-first retention.
+    if (
+        $null -eq $checkpointEvent -and
+        -not [string]::IsNullOrWhiteSpace($savedUpdatedAt)
+    ) {
+        $hasLowerRecord = @(
+            $AvailableEvents |
+            Where-Object {
+                [long]$_.RecordId -lt $checkpointId
+            }
+        ).Count -gt 0
+
+        $hasHigherRecord = @(
+            $AvailableEvents |
+            Where-Object {
+                [long]$_.RecordId -gt $checkpointId
+            }
+        ).Count -gt 0
+
+        if ($hasLowerRecord -and $hasHigherRecord) {
+            try {
+                $legacyCheckpointWritten = [DateTimeOffset]::Parse(
+                    $savedUpdatedAt,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+
+                $hasLowerRecordCreatedAfterCheckpoint = @(
+                    $AvailableEvents |
+                    Where-Object {
+                        [long]$_.RecordId -lt $checkpointId -and
+                        $null -ne $_.TimeCreated -and
+                        ([DateTimeOffset]$_.TimeCreated) -gt
+                            $legacyCheckpointWritten
+                    }
+                ).Count -gt 0
+
+                if ($hasLowerRecordCreatedAfterCheckpoint) {
+                    return [PSCustomObject]@{
+                        reset_detected = $true
+                        reason         = (
+                            "Legacy checkpoint anchor is absent and lower " +
+                            "RecordIds were created after the checkpoint; " +
+                            "treating this as a recreated log generation"
+                        )
+                    }
+                }
+            }
+            catch {
+                # If timestamps are unavailable or invalid, do not infer reset.
+            }
+        }
+    }
 
     if (
         $null -ne $checkpointEvent -and
