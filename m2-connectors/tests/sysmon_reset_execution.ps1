@@ -216,6 +216,9 @@ param(
         "reset",
         "reset25",
         "legacyMissingAnchor",
+        "legacyUnchangedAnchor",
+        "legacyMissingAnchorOld",
+        "legacyRetention",
         "empty",
         "failure"
     )]
@@ -231,7 +234,18 @@ function New-FakeSysmonEvent {
         [Parameter(Mandatory = $true)]
         [long]$RecordId,
 
-        [string]$Generation = "NEW"
+        [string]$Generation = "NEW",
+
+        [string]$CreatedUtc = "2026-10-19T08:00:00Z"
+    )
+
+    $utcInstant = [DateTimeOffset]::Parse(
+        $CreatedUtc,
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    $utcValue = $utcInstant.UtcDateTime.ToString(
+        "yyyy-MM-dd HH:mm:ss.fff",
+        [Globalization.CultureInfo]::InvariantCulture
     )
 
     $xml = @"
@@ -239,13 +253,13 @@ function New-FakeSysmonEvent {
 <System>
 <Provider Name='Microsoft-Windows-Sysmon'/>
 <EventID>1</EventID>
-<TimeCreated SystemTime='2026-10-19T08:00:00.0000000Z'/>
+<TimeCreated SystemTime='$CreatedUtc'/>
 <EventRecordID>$RecordId</EventRecordID>
 <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
 <Computer>RESET-PC</Computer>
 </System>
 <EventData>
-<Data Name='UtcTime'>2026-10-19 08:00:00.000</Data>
+<Data Name='UtcTime'>$utcValue</Data>
 <Data Name='ProcessGuid'>{${Generation}-$RecordId}</Data>
 <Data Name='ProcessId'>$RecordId</Data>
 <Data Name='Image'>C:\Windows\System32\cmd.exe</Data>
@@ -263,9 +277,7 @@ function New-FakeSysmonEvent {
         ProviderName = "Microsoft-Windows-Sysmon"
         LogName      = "Microsoft-Windows-Sysmon/Operational"
         MachineName  = "RESET-PC"
-        TimeCreated  = [datetime]::Parse(
-            "2026-10-19T08:00:00Z"
-        ).ToUniversalTime()
+        TimeCreated  = $utcInstant.UtcDateTime
         Xml          = $xml
     }
 
@@ -308,6 +320,32 @@ function Get-WinEvent {
             })
         }
 
+        "legacyUnchangedAnchor" {
+            return @(foreach ($id in (1..25)) {
+                New-FakeSysmonEvent `
+                    -RecordId $id `
+                    -CreatedUtc "2026-10-19T06:50:00Z"
+            })
+        }
+
+        "legacyMissingAnchorOld" {
+            $ids = @((1..19) + (21..25))
+
+            return @(foreach ($id in $ids) {
+                New-FakeSysmonEvent `
+                    -RecordId $id `
+                    -CreatedUtc "2026-10-19T06:50:00Z"
+            })
+        }
+
+        "legacyRetention" {
+            return @(foreach ($id in (21..25)) {
+                New-FakeSysmonEvent `
+                    -RecordId $id `
+                    -CreatedUtc "2026-10-19T08:00:00Z"
+            })
+        }
+
         "empty" {
             $exception = New-Object System.Exception(
                 "No events were found that match the specified selection criteria."
@@ -329,6 +367,8 @@ function Get-WinEvent {
         }
     }
 }
+
+Write-Host ("Harness timezone: " + [TimeZoneInfo]::Local.Id)
 
 & $ConnectorPath `
     -Once `
@@ -361,6 +401,9 @@ function Invoke-Harness {
 
         [int]$Port = 0,
 
+        [AllowNull()]
+        [string]$Timezone = $null,
+
         [Parameter(Mandatory = $true)]
         [string]$StdoutPath,
 
@@ -373,13 +416,25 @@ function Invoke-Harness {
         '-ConnectorPath "{1}" -Mode "{2}" -Port {3}'
     ) -f $HarnessPath, $ConnectorPath, $Mode, $Port
 
-    $process = Start-Process `
-        -FilePath $ShellPath `
-        -ArgumentList $argumentLine `
-        -Wait `
-        -PassThru `
-        -RedirectStandardOutput $StdoutPath `
-        -RedirectStandardError $StderrPath
+    # TZ is inherited by the spawned PowerShell process on Unix.
+    # Restore our own environment even if Start-Process fails.
+    $oldTimezone = [Environment]::GetEnvironmentVariable("TZ", "Process")
+    try {
+        if (-not [string]::IsNullOrEmpty($Timezone)) {
+            [Environment]::SetEnvironmentVariable("TZ", $Timezone, "Process")
+        }
+
+        $process = Start-Process `
+            -FilePath $ShellPath `
+            -ArgumentList $argumentLine `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $StdoutPath `
+            -RedirectStandardError $StderrPath
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("TZ", $oldTimezone, "Process")
+    }
 
     $stdout = ""
     $stderr = ""
@@ -404,6 +459,108 @@ function Invoke-Harness {
         Stderr   = $stderr
     }
 }
+
+function Invoke-LegacyTimezoneCase {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Scenario,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Mode,
+
+        [Parameter(Mandatory = $true)]
+        [object[]]$ExpectedIds,
+
+        [AllowNull()]
+        [string]$Timezone = $null
+    )
+
+    $caseLabel = "$Scenario / $Timezone"
+    if ([string]::IsNullOrEmpty($Timezone)) {
+        $caseLabel = "$Scenario / system timezone"
+    }
+
+    # Force the legacy format (without last_record_sha256).
+    Write-CheckpointFile -Path $checkpointPath -Value ([ordered]@{
+        last_record_id = 20
+        updated_at = "2026-10-19T07:00:00Z"
+    })
+
+    $port = Get-Random -Minimum 25000 -Maximum 45000
+    $receiver = Start-TcpRecorder -Port $port -ExpectedLines $ExpectedIds.Count
+    Start-Sleep -Milliseconds 500
+
+    $fileSuffix = [Guid]::NewGuid().ToString("N")
+    $result = Invoke-Harness `
+        -ShellPath $shellPath `
+        -HarnessPath $harnessPath `
+        -ConnectorPath $connectorPath `
+        -Mode $Mode `
+        -Timezone $Timezone `
+        -Port $port `
+        -StdoutPath (Join-Path $tempRoot "$fileSuffix.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "$fileSuffix.stderr.txt")
+
+    $capture = Receive-RecorderResult -Job $receiver
+    Assert-Equal $result.ExitCode 0 "$caseLabel exit code; $($result.Stderr)"
+    Assert-True (-not $capture.timed_out) "$caseLabel recorder timed out"
+    Assert-Equal @($capture.lines).Count $ExpectedIds.Count "$caseLabel count"
+
+    if (-not [string]::IsNullOrEmpty($Timezone)) {
+        Assert-True (
+            $result.Stdout.Contains("Harness timezone: $Timezone")
+       ) "${caseLabel}: TZ override was not applied to child PowerShell"
+    }
+
+    $actualIds = @(foreach ($line in $capture.lines) {
+        [long](($line | ConvertFrom-Json).winlog.record_id)
+    })
+    Assert-Sequence `
+        -Actual $actualIds `
+        -Expected $ExpectedIds `
+        -Message "$caseLabel sent RecordIds"
+
+    if ($ExpectedIds.Count -eq 5) {
+        Assert-True (
+            $result.Stdout -notmatch "Sysmon event-log generation changed"
+        ) "$caseLabel falsely detected a generation change"
+    }
+
+    $checkpoint = Read-CheckpointFile -Path $checkpointPath
+    Assert-Equal $checkpoint.last_record_id 25 "$caseLabel checkpoint RecordId"
+    Assert-True (
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$checkpoint.last_record_sha256
+        )
+    ) "$caseLabel checkpoint fingerprint missing"
+
+    # Every scenario must be idempotent on a second unchanged run.
+    # Port 1 has no receiver: any attempted replay should fail the run.
+    $second = Invoke-Harness `
+        -ShellPath $shellPath `
+        -HarnessPath $harnessPath `
+        -ConnectorPath $connectorPath `
+        -Mode $Mode `
+        -Timezone $Timezone `
+        -Port 1 `
+        -StdoutPath (Join-Path $tempRoot "$fileSuffix.second.stdout.txt") `
+        -StderrPath (Join-Path $tempRoot "$fileSuffix.second.stderr.txt")
+
+    Assert-Equal $second.ExitCode 0 "$caseLabel second-run exit code"
+    Assert-True (
+        $second.Stdout -notmatch "Sent Sysmon Event ID"
+    ) "$caseLabel replayed events on second run"
+
+    $afterSecond = Read-CheckpointFile -Path $checkpointPath
+    Assert-Equal $afterSecond.last_record_id 25 "$caseLabel second checkpoint RecordId"
+    Assert-Equal `
+        $afterSecond.last_record_sha256 `
+        $checkpoint.last_record_sha256 `
+        "$caseLabel second checkpoint fingerprint"
+
+    Write-Host "[PASS] ${caseLabel}: $($ExpectedIds.Count) events, no replay"
+}
+
 
 function New-OldGenerationEvent20Xml {
     return @"
@@ -702,6 +859,47 @@ try {
         -StderrPath (Join-Path $tempRoot "failure.stderr.txt")
 
     Assert-Equal $failureResult.ExitCode 1 "Genuine read failure exit code"
+
+    # Multi-zone regression: POSITIVE (+07:00) and NEGATIVE (-07:00)
+    # offsets need real per-process local timezone changes. On Unix/.NET,
+    # the TZ environment variable affects the child process's timezone.
+    # Windows ignores TZ; run the scenarios in its actual local timezone
+    # instead, while the Ubuntu CI matrix exercises both explicit zones.
+    if ([Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [Runtime.InteropServices.OSPlatform]::Windows
+        )) {
+        $timezones = @($null)
+        Write-Host "[INFO] Windows: timezone override unavailable; testing system zone."
+    }
+    else {
+        $timezones = @("UTC", "Asia/Jakarta", "America/Los_Angeles")
+    }
+
+    foreach ($timezone in $timezones) {
+        Invoke-LegacyTimezoneCase `
+            -Scenario "Recreated legacy log" `
+            -Mode "legacyMissingAnchor" `
+            -ExpectedIds @((1..19) + (21..25)) `
+            -Timezone $timezone
+
+        Invoke-LegacyTimezoneCase `
+            -Scenario "Unchanged legacy anchor" `
+            -Mode "legacyUnchangedAnchor" `
+            -ExpectedIds @(21..25) `
+            -Timezone $timezone
+
+        Invoke-LegacyTimezoneCase `
+            -Scenario "Missing anchor but old events" `
+            -Mode "legacyMissingAnchorOld" `
+            -ExpectedIds @(21..25) `
+            -Timezone $timezone
+
+        Invoke-LegacyTimezoneCase `
+            -Scenario "Ordinary oldest-first retention" `
+            -Mode "legacyRetention" `
+            -ExpectedIds @(21..25) `
+            -Timezone $timezone
+    }
 
     Write-Host "[PASS] Sysmon reset, fingerprint generation, legacy missing-anchor migration,"
     Write-Host "       second-run no-replay, idle poll, and genuine read-failure tests."

@@ -143,7 +143,7 @@ function Read-Checkpoint {
         ]
 
         if ($null -ne $updatedProperty) {
-            $updatedAt = [string]$updatedProperty.Value
+            $updatedAt = ([DateTimeOffset]$updatedProperty.Value).ToUniversalTime().ToString("o")
         }
         else {
             $updatedAt = $null
