@@ -51,8 +51,8 @@ def classify(record: dict, source_hint: str | None = None) -> str | None:
         "UtcTime", "winlog.event_data.UtcTime", "ProcessGuid", "winlog.event_data.ProcessGuid"
     )) and any(
         get_field(record, field) is not MISSING for field in (
-            "Image", "winlog.event_data.Image", "process.executable",
-            "CommandLine", "winlog.event_data.CommandLine", "process.command_line"
+            "Image", "winlog.event_data.Image", "process.executable", "process_name",
+            "CommandLine", "winlog.event_data.CommandLine", "process.command_line", "command_line"
         )
     ):
         return "sysmon"

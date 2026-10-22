@@ -19,6 +19,8 @@ Numeric event IDs and generic process/logon aliases alone do not select Windows
 Security or Sysmon. Legacy generic records need explicit source metadata or a
 hint; otherwise they follow the unregistered/custom-format path. Flat Sysmon
 `UtcTime`/`ProcessGuid` plus native process fields remain detectable automatically.
+With that native provenance, the supported `process_name` and `command_line`
+aliases also select the bundled Sysmon parser. Those aliases alone do not.
 
 Bundled parsers accept decoded Windows/Winlogbeat JSON and Zeek conn/DNS/HTTP
 JSON, including nested, dotted, and mixed fields. JSON must contain

@@ -4,6 +4,24 @@ Compared with the original pull request containing 61 offline automated tests,
 this revision corrects field semantics, strengthens validation, and keeps
 malformed records from interrupting unrelated records.
 
+## Follow-up review: 23 October 2026
+
+- Fixed the guarded Sysmon signature to include `process_name` and `command_line`
+  when native `UtcTime` or `ProcessGuid` provenance is present. Generic aliases
+  and event numbers alone still do not establish the source.
+- Valid alias records reuse the bundled parser and retain available executable,
+  command-line, and process entity ID fields. Directory-only paths and missing
+  creation-event executables stay on the Sysmon quarantine path, with no custom
+  parser generation.
+- Added eight regression tests covering flat, nested, dotted, and mixed native
+  provenance, independent alias detection, mixed batches, and frozen reuse.
+  The bundled parser definitions and versions are unchanged.
+
+Current verification: **130 automated tests passed**, with no skips. Both
+**4,968-case** mutation checks completed without unexpected failures. The full
+demo and connector replay passed, accepting **20 Windows**, **1 Sysmon**, and
+**3 Zeek** records.
+
 ## Follow-up review: 22 October 2026
 
 - Removed event-number and generic process/logon heuristics that could claim
@@ -22,7 +40,7 @@ malformed records from interrupting unrelated records.
   payload/result artifacts, input hashes, repeated-output checks, and quarantine
   probes. The CI matrix now runs connector replay and uploads its reports.
 
-Current verification: **122 automated tests passed**, plus **4,968 pipeline**
+Verification at that review: **122 automated tests passed**, plus **4,968 pipeline**
 and **4,968 frozen-agent** field variations without unexpected failures. The
 mutation count increased because the fixtures now contain provenance fields.
 Connector replay accepted **20 Windows**, **1 Sysmon**, and **3 Zeek** records.

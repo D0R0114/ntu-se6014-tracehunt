@@ -26,10 +26,11 @@ python -m tracehunt_schema schemas
 
 The demo creates a new directory under `output/` and exercises normalization,
 quarantine, manual approval, automatic onboarding, and frozen parser reuse.
-All fixtures in this module are synthetic. The 122 tests run offline; model
+All fixtures in this module are synthetic. The 130 tests run offline; model
 responses are mocked. Connector replay uses separately documented samples.
 Regression tests cover HTTP Host mapping, whitespace-only identifiers, flat
-and mixed-field Sysmon detection, numeric limits, registry/file protection,
+and mixed-field Sysmon detection, native provenance with generic process
+aliases, numeric limits, registry/file protection,
 and continued processing after malformed input.
 For additional resilience checks, run `python tests/mutation_check.py`.
 
@@ -130,6 +131,6 @@ Only unregistered formats send samples to the selected endpoint.
 - [Review updates](CHANGES.md): changes and validation compared with the original pull request.
 - [Connector validation](INTEGRATION.md): reproducible replay, evidence, and data provenance.
 
-The current implementation and local verification are complete: 122 automated
+The current implementation and local verification are complete: 130 automated
 tests passed, both field-mutation checks passed, and connector replay passed.
 
