@@ -1,0 +1,38 @@
+name: M2 Connectors tests
+
+on:
+  push:
+    branches:
+      - m2-connectors
+    paths:
+      - "m2-connectors/**"
+      - ".github/workflows/m2-connectors-tests.yml"
+
+  pull_request:
+    paths:
+      - "m2-connectors/**"
+      - ".github/workflows/m2-connectors-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: Regression tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run M2 regression tests
+        shell: pwsh
+        run: |
+          ./m2-connectors/tests/run_tests.ps1
