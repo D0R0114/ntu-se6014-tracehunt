@@ -89,7 +89,8 @@ class MappingTests(unittest.TestCase):
 
     def test_dotted_ecs_input_is_supported(self):
         sample = {"@timestamp": "2026-09-30T07:00:00Z", "event.code": "4625",
-                  "host.name": "WS-01", "user.name": "lab-user", "source.ip": "::1"}
+                  "host.name": "WS-01", "user.name": "lab-user", "source.ip": "::1",
+                  "event.dataset": "windows.security"}
         result = self.pipeline.process(sample)
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(result["event"]["source"]["ip"], "::1")
@@ -161,7 +162,7 @@ class QualityTests(unittest.TestCase):
 
     def test_process_creation_requires_executable(self):
         sample = {"@timestamp": "2026-09-30T07:12:00Z", "event_id": 1,
-                  "host": "WS-01", "command_line": "powershell.exe"}
+                  "host": "WS-01", "command_line": "powershell.exe", "event.dataset": "sysmon.events"}
         self.assert_failure(sample, "missing_field", "process.executable")
 
     def test_unknown_format_is_not_automatically_activated(self):

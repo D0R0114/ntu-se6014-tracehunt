@@ -1,0 +1,3 @@
+{"@timestamp":"2026-09-30T07:00:00Z","event_id":4625,"host_name":"custom-system","username":"alice"}
+{"@timestamp":"2026-09-30T07:00:00Z","event_id":4700,"host_name":"custom-system","username":"alice"}
+{"@timestamp":"2026-09-30T07:00:00Z","event_id":1,"hostname":"custom-system","command_line":"echo hello"}

@@ -21,13 +21,21 @@ def classify(record: dict, source_hint: str | None = None) -> str | None:
             raise RecordError("invalid_source", f"source must be one of {SOURCES}")
         return source_hint
 
-    provider = metadata_text(record, "winlog.provider_name")
-    provider += " " + metadata_text(record, "event.provider")
+    providers = {metadata_text(record, field).lower() for field in (
+        "winlog.provider_name", "event.provider"
+    )}
     channel = metadata_text(record, "winlog.channel").lower()
     dataset = metadata_text(record, "event.dataset").lower()
-    if "sysmon" in provider.lower() or "sysmon" in channel or dataset.startswith("sysmon"):
+    declared_source = metadata_text(record, "source_type")
+    if declared_source in SOURCES:
+        return declared_source
+    if providers & {"microsoft-windows-sysmon", "sysmon"} or channel == "microsoft-windows-sysmon/operational" or (
+        dataset == "sysmon" or dataset.startswith("sysmon.")
+    ):
         return "sysmon"
-    if channel == "security" or "security-auditing" in provider.lower() or dataset == "windows.security":
+    if channel == "security" or dataset == "windows.security" or providers & {
+        "microsoft-windows-security-auditing", "security-auditing"
+    }:
         return "windows-security"
     if dataset.startswith("zeek.") or record.get("log_type") in ("conn", "dns", "http"):
         return "zeek"
@@ -39,30 +47,20 @@ def classify(record: dict, source_hint: str | None = None) -> str | None:
         return "zeek"
     # Distinctive source fields still identify malformed known records. They
     # must fail the bundled parser instead of onboarding as a custom format.
-    if any(get_field(record, field) is not MISSING for field in ("UtcTime", "winlog.event_data.UtcTime")) and any(
-        get_field(record, field) is not MISSING for field in ("Image", "winlog.event_data.Image", "process.executable")
+    if any(get_field(record, field) is not MISSING for field in (
+        "UtcTime", "winlog.event_data.UtcTime", "ProcessGuid", "winlog.event_data.ProcessGuid"
+    )) and any(
+        get_field(record, field) is not MISSING for field in (
+            "Image", "winlog.event_data.Image", "process.executable",
+            "CommandLine", "winlog.event_data.CommandLine", "process.command_line"
+        )
     ):
         return "sysmon"
     if any(get_field(record, field) is not MISSING for field in (
-        "winlog.event_data.TargetUserName", "TargetUserName", "winlog.event_data.LogonType", "LogonType", "logon_type"
+        "winlog.event_data.TargetUserName", "TargetUserName", "winlog.event_data.LogonType", "LogonType"
     )):
         return "windows-security"
 
-    event_code = MISSING
-    for field in ("event.code", "winlog.event_id", "event_id", "EventID"):
-        candidate = get_field(record, field)
-        if candidate is not MISSING and candidate is not None and candidate not in ("", "-"):
-            event_code = candidate
-            break
-    try:
-        code = int(event_code)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if 4600 <= code <= 4999:
-        return "windows-security"
-    if 1 <= code <= 29 and any(get_field(record, field) is not MISSING for field in (
-        "process.executable", "winlog.event_data.Image", "process_name", "Image",
-        "process.command_line", "winlog.event_data.CommandLine", "command_line", "CommandLine"
-    )):
-        return "sysmon"
+    # Event numbers and generic process fields also occur in custom applications.
+    # Without provenance, leave the format available for reviewed onboarding.
     return None

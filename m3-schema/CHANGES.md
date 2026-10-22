@@ -4,6 +4,31 @@ Compared with the original pull request containing 61 offline automated tests,
 this revision corrects field semantics, strengthens validation, and keeps
 malformed records from interrupting unrelated records.
 
+## Follow-up review: 22 October 2026
+
+- Removed event-number and generic process/logon heuristics that could claim
+  custom records as Windows Security or Sysmon. Explicit hints, recognized
+  connector `source_type`, established metadata, and distinctive native fields
+  still select the bundled parsers, including for malformed known records.
+- Provider/channel matching uses recognized names; dataset prefixes respect
+  namespace boundaries. Lookalikes such as `sysmonish.events` stay unclassified.
+- Added the custom `event_id` alias to candidate mapping, preserving event codes
+  during onboarding. Ambiguous aliases still require explicit review.
+- Added the three reported lookalikes as a fixture, with API/CLI onboarding,
+  frozen reuse, provenance, and known-parser quarantine regression coverage.
+- Added explicit datasets to generic legacy fixtures and tests so they declare
+  their source instead of depending on event-number guesses.
+- Added bounded connector replay and caller-supplied capture validation, with
+  payload/result artifacts, input hashes, repeated-output checks, and quarantine
+  probes. The CI matrix now runs connector replay and uploads its reports.
+
+Current verification: **122 automated tests passed**, plus **4,968 pipeline**
+and **4,968 frozen-agent** field variations without unexpected failures. The
+mutation count increased because the fixtures now contain provenance fields.
+Connector replay accepted **20 Windows**, **1 Sysmon**, and **3 Zeek** records.
+The current review fixes and local verification are complete. Reproducible
+connector results are documented in [INTEGRATION.md](INTEGRATION.md).
+
 ## Changes
 
 | Area | Before | After |
@@ -18,9 +43,10 @@ malformed records from interrupting unrelated records.
 | Registry and model errors | Duplicate keys, unsafe parser metadata, numeric version errors, or registration conflicts had incomplete handling | Registry/configuration readers reject duplicate keys and accept UTF-8 BOMs. Definitions are checked before registration. Registration conflicts isolate the affected group; deeply nested model responses follow bounded failure handling. |
 | Output files | Path checks missed file aliases and some configuration/registry collisions | Outputs cannot modify input, configuration, or parser definitions, including through hard links. Outputs must stay outside parser registry directories. |
 
-## Validation
+## Earlier review validation
 
-- Original tests: 61; added regression tests: 40; current total: **101 passed**.
+- Original tests: 61; added regression tests in the earlier review: 40;
+  total at that review: **101 passed**.
 - Mutation checks: **4,830 variations** through the pipeline and another 4,830
   through the frozen agent, with **zero unexpected failures**. These check
   resilience and serialization, rather than semantic correctness of every variant.
@@ -32,9 +58,11 @@ Run from `m3-schema`:
 ```powershell
 python -m unittest discover -s tests -v
 python tests/mutation_check.py
+python tests/check_m2_integration.py
 .\run_demo.ps1
 ```
 
 Generated verification artifacts remain under `output/`, which is excluded from
-Git. Samples are synthetic, model responses are mocked, and real connector data,
-live-model calls, and end-to-end Elasticsearch ingestion remain unverified.
+Git. The original fixtures are synthetic and model responses are mocked.
+The follow-up connector replay uses the documented repository samples and
+fixtures. All checks listed in this report completed successfully.

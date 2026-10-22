@@ -90,6 +90,18 @@ try {
         "--audit", (Join-Path $demoOutput "agent/frozen-decisions.jsonl"),
         "--registry", $agentRegistry, "--frozen"
     )
+    $lookalikeRegistry = Join-Path $demoOutput "lookalikes/registry"
+    foreach ($mode in @("first", "frozen")) {
+        $lookalikeArgs = @(
+            "onboard", "--input", "fixtures/custom-lookalikes.ndjson",
+            "--output", (Join-Path $demoOutput "lookalikes/$mode.jsonl"),
+            "--quarantine", (Join-Path $demoOutput "lookalikes/quarantine.jsonl"),
+            "--audit", (Join-Path $demoOutput "lookalikes/$mode-decisions.jsonl"),
+            "--registry", $lookalikeRegistry
+        )
+        if ($mode -eq "frozen") { $lookalikeArgs += "--frozen" }
+        Invoke-DemoStage -Name "Process custom event-number lookalikes ($mode)" -ExpectedExit 0 -Arguments $lookalikeArgs
+    }
     Write-Host "Demo completed. Inspect output at: $demoOutput" -ForegroundColor Green
 } finally {
     Pop-Location

@@ -11,9 +11,17 @@ Implemented interface for **tracehunt-schema 1.0.0**. Run Python examples from
 - `source_hint` is optional; otherwise the source is classified from record fields.
 - `raw_text` is optional; valid Unicode strings preserve the original event text exactly.
 
+Detection prioritizes `source_hint`, then a recognized string `source_type`, then
+provider/channel/dataset metadata or distinctive native field combinations.
+Supported `source_type` values are the four source names listed above; other
+strings do not select a parser. Non-string source metadata is invalid.
+Numeric event IDs and generic process/logon aliases alone do not select Windows
+Security or Sysmon. Legacy generic records need explicit source metadata or a
+hint; otherwise they follow the unregistered/custom-format path. Flat Sysmon
+`UtcTime`/`ProcessGuid` plus native process fields remain detectable automatically.
+
 Bundled parsers accept decoded Windows/Winlogbeat JSON and Zeek conn/DNS/HTTP
-JSON, including nested, dotted, and mixed fields. Flat Sysmon `EventID`, `Image`, and
-`CommandLine` fields can be classified without a source hint. JSON must contain
+JSON, including nested, dotted, and mixed fields. JSON must contain
 finite values, valid Unicode, string object keys, and at most 64 levels of nesting.
 CLI decoding rejects duplicate keys. Malformed records are quarantined individually;
 later records continue through both `normalize` and `onboard`.

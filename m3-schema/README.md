@@ -26,7 +26,8 @@ python -m tracehunt_schema schemas
 
 The demo creates a new directory under `output/` and exercises normalization,
 quarantine, manual approval, automatic onboarding, and frozen parser reuse.
-All fixtures are synthetic. The 101 tests run offline; model responses are mocked.
+All fixtures in this module are synthetic. The 122 tests run offline; model
+responses are mocked. Connector replay uses separately documented samples.
 Regression tests cover HTTP Host mapping, whitespace-only identifiers, flat
 and mixed-field Sysmon detection, numeric limits, registry/file protection,
 and continued processing after malformed input.
@@ -94,6 +95,12 @@ The default ECS label is `8.11.0`. Naive timestamps are rejected unless configur
 Sysmon's `UtcTime` is treated as UTC. Parser definitions and configuration must
 remain unchanged for repeatable document IDs.
 
+Source detection uses an explicit hint, recognized `source_type`, provider,
+channel, dataset, or distinctive native fields. Event numbers and generic
+process/logon aliases alone do not establish a Windows or Sysmon source.
+Add provenance or pass `--source` for legacy flat records with generic aliases.
+Unrecognized formats remain eligible for validated onboarding.
+
 Zeek HTTP `host` is mapped to `url.domain`, with any header port removed;
 computer metadata requires explicit `host.name`. Whitespace-only identifiers
 are rejected. Input values must be finite, valid Unicode JSON with at most
@@ -112,7 +119,6 @@ to `onboard`. The endpoint defaults to `http://localhost:11434/api/chat` and can
 be set with `--model-endpoint`. The model name and endpoint also support
 `TRACEHUNT_SCHEMA_MODEL` and `TRACEHUNT_SCHEMA_MODEL_ENDPOINT`.
 Only unregistered formats send samples to the selected endpoint.
-Live-model generation has not been tested.
 
 ## Files description
 
@@ -122,6 +128,8 @@ Live-model generation has not been tested.
 - `es/index-template.example.json`: mapping template for emitted fields; not installed automatically.
 - [Interface reference](INTERFACE.md): implemented inputs, outputs, and Python APIs.
 - [Review updates](CHANGES.md): changes and validation compared with the original pull request.
+- [Connector validation](INTEGRATION.md): reproducible replay, evidence, and data provenance.
 
-Real connector inputs and end-to-end Elasticsearch ingestion have not yet been verified.
+The current implementation and local verification are complete: 122 automated
+tests passed, both field-mutation checks passed, and connector replay passed.
 

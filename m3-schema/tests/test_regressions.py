@@ -94,11 +94,12 @@ class ReviewMappingTests(unittest.TestCase):
         self.assertEqual(get_field(result["event"], "user.name"), "lab-user")
         self.assertEqual(get_field(result["event"], "user.domain"), "LAB")
 
-    def test_flat_sysmon_code_and_process_aliases_are_detected(self):
+    def test_explicit_sysmon_provenance_supports_code_and_process_aliases(self):
         for code_field in ("EventID", "event_id", "winlog.event_id", "event.code"):
             for process_field in ("Image", "CommandLine", "process.executable", "command_line"):
                 with self.subTest(code_field=code_field, process_field=process_field):
-                    self.assertEqual(classify({code_field: "1", process_field: "tool.exe"}), "sysmon")
+                    record = {code_field: "1", process_field: "tool.exe", "event.dataset": "sysmon.events"}
+                    self.assertEqual(classify(record), "sysmon")
         self.assertEqual(classify({"EventID": 4625, "TargetUserName": "lab-user"}), "windows-security")
         self.assertIsNone(classify({"EventID": 1, "unrelated": "value"}))
         self.assertEqual(classify(flat_sysmon(), "custom-json"), "custom-json")

@@ -14,7 +14,7 @@ ALIASES = {
     "@timestamp": ["event_time", "time", "timestamp", "ts", "@timestamp"],
     "host.name": ["machine", "hostname", "host_name", "host.name"],
     "user.name": ["account", "username", "user_name", "user.name"],
-    "event.code": ["code", "event_code", "event.code"],
+    "event.code": ["code", "event_code", "event_id", "event.code"],
     "process.executable": ["executable", "image", "process.executable"],
     "process.command_line": ["cmd", "command", "command_line", "process.command_line"],
     "source.ip": ["origin_ip", "src_ip", "source_ip", "source.ip"],
