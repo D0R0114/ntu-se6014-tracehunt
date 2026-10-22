@@ -58,6 +58,13 @@ jobs:
           python tests/mutation_check.py 2>&1 | Tee-Object -FilePath output/ci/mutation-check.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Verify M2 connector output
+        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+        run: |
+          New-Item -ItemType Directory -Path output/ci -Force | Out-Null
+          python tests/check_m2_integration.py --output output/ci/m2 2>&1 | Tee-Object -FilePath output/ci/m2-integration.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload verification reports
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
